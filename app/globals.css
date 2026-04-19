@@ -6,12 +6,13 @@ html, body {
 }
 
 body {
+  background-color: #071738;
   background: linear-gradient(
     to bottom,
-    #a8c8e8 0%,
-    #a8c8e8 45%,
-    #f4f6f8 55%,
-    #f4f6f8 100%
+    #071738 0%,
+    #071738 75%,
+    #eff2f1 75%,
+    #eff2f1 100%
   );
 }
 

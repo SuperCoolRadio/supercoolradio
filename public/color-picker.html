@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SCR color picker</title>
+  <style>
+    body { margin: 0; padding: 20px; font-family: sans-serif; background: #222; color: white; }
+    h1 { margin: 0 0 10px 0; }
+    p { line-height: 1.5; max-width: 600px; }
+    img { display: block; border: 2px solid white; margin: 10px 0; image-rendering: pixelated; width: 512px; height: 512px; }
+    button { padding: 10px 20px; font-size: 16px; cursor: pointer; margin-right: 10px; }
+    #result { font-family: monospace; font-size: 18px; padding: 15px; background: white; color: black; margin-top: 10px; border-radius: 4px; display: inline-block; }
+    .swatch { display: inline-block; width: 30px; height: 30px; border: 1px solid black; vertical-align: middle; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  <h1>SuperCoolRadio color picker</h1>
+  <p>
+    <strong>How to use:</strong> Click the "Pick a color" button. Your cursor becomes an eyedropper. Move to the very top edge of the image (for the North Pole / sky color) or the very bottom edge (for the South Pole / ice color) and click. The hex code will appear below — copy it and paste it to Claude.
+  </p>
+  <p>Requires Chrome or Edge.</p>
+  <button onclick="pick()">Pick a color</button>
+  <img src="https://tiles.supercoolradio.com/tiles/0/0/0.webp" alt="world at zoom 0">
+  <div id="result">No color picked yet.</div>
+  <script>
+    async function pick() {
+      if (!window.EyeDropper) {
+        document.getElementById('result').textContent = 'EyeDropper not supported. Use Chrome or Edge.';
+        return;
+      }
+      try {
+        const dropper = new EyeDropper();
+        const result = await dropper.open();
+        document.getElementById('result').innerHTML =
+          'Picked: <strong>' + result.sRGBHex + '</strong>' +
+          '<span class="swatch" style="background:' + result.sRGBHex + '"></span>';
+      } catch (e) {
+        document.getElementById('result').textContent = 'Cancelled.';
+      }
+    }
+  </script>
+</body>
+</html>
