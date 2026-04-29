@@ -1,22 +1,548 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
+
+type TreeNode = {
+  code: string;
+  name: string;
+  display_name?: string;
+  level: 'World' | 'Area' | 'Region' | 'Sub-Region';
+  iso_alpha3?: string;
+  shape_id?: string;
+  population?: number;
+  children?: TreeNode[];
+};
+
+const BOUNDARIES_BASE = 'https://boundaries.supercoolradio.com/tree';
+
+// Border color by administrative level. ADM0 (Areas) green, ADM1
+// (Regions) yellow, ADM2 (Sub-Regions) cyan. Bright pure-channel colors
+// chosen for high-contrast visibility against both ocean (#071738) and
+// land (#eff2f1) backgrounds. Districts (ADM3) will get their own color
+// when that tier is built.
+const BORDER_COLOR_BY_LEVEL: Record<TreeNode['level'], string> = {
+  World:        '#00ff00', // unused — World itself has no border
+  Area:         '#00ff00',
+  Region:       '#ffff00',
+  'Sub-Region': '#00ffff',
+};
+const BORDER_WEIGHT = 2;
+
+// Areas whose polygons sit inside another Area's polygon and would
+// otherwise be unclickable because the containing Area's invisible
+// hit-target sits on top. Per Partitioning Rule 5, these are the six
+// "possessions" the algorithm detected: Taiwan inside China; American
+// Samoa, Guam, Northern Mariana Islands, Puerto Rico, and US Virgin
+// Islands inside USA. We bringToFront() these layers after attaching
+// so they paint on top of their container in DOM order, which is what
+// SVG paint order and Leaflet hit-testing both follow.
+const POSSESSION_CODES = new Set([
+  '016', // American Samoa
+  '158', // Taiwan (the Area)
+  '316', // Guam
+  '580', // Northern Mariana Islands
+  '630', // Puerto Rico
+  '850', // US Virgin Islands
+  // Taiwan-as-Region-of-China sits at the END of this set so the
+  // bringToFront iteration delivers it last — above Area 158 at
+  // China view, so users can click it to drill into China > Taiwan.
+  // No effect at world view, where 156-034 isn't attached.
+  '156-034', // Taiwan (province, China-claim)
+]);
+
+// Walk tree.json once to build:
+//   - codeToNode: lookup any node by code
+//   - codeToAncestry: full ancestry path including the node itself,
+//     starting at World, e.g. '840-006' -> ['000', '840', '840-006']
+type TreeIndex = {
+  codeToNode: Map<string, TreeNode>;
+  codeToAncestry: Map<string, string[]>;
+};
+
+const indexTree = (root: TreeNode): TreeIndex => {
+  const codeToNode = new Map<string, TreeNode>();
+  const codeToAncestry = new Map<string, string[]>();
+  const walk = (node: TreeNode, ancestors: string[]) => {
+    const ancestry = [...ancestors, node.code];
+    codeToNode.set(node.code, node);
+    codeToAncestry.set(node.code, ancestry);
+    for (const child of node.children ?? []) {
+      walk(child, ancestry);
+    }
+  };
+  walk(root, []);
+  return { codeToNode, codeToAncestry };
+};
+
+const extractGeometry = (
+  geojson: GeoJSON.GeoJSON,
+): GeoJSON.Geometry | null => {
+  if (geojson.type === 'FeatureCollection') {
+    if (geojson.features.length === 0) return null;
+    return geojson.features[0].geometry;
+  }
+  if (geojson.type === 'Feature') return geojson.geometry;
+  if (geojson.type === 'Polygon' || geojson.type === 'MultiPolygon') return geojson;
+  return null;
+};
+
+// Compute a bounding box for a polygon, correctly handling antimeridian-
+// crossing geometries (USA via the Aleutians, Russia, Fiji, etc.).
+//
+// Latitude is straightforward: min and max.
+//
+// Longitude lives on a circle, so the right notion of "bounds" is: find
+// the largest empty arc on that circle, and the bounding interval is its
+// complement. Concretely:
+//   1. Sort all longitudes ascending.
+//   2. Compute the gap between each consecutive pair, plus the wrap-gap
+//      from the last entry back to the first via ±180.
+//   3. The largest gap is the empty arc.
+//   4. The complement of that gap on the circle is [minLng, maxLng].
+//
+// For ordinary countries (France, China) the wrap-gap is the largest, and
+// the result collapses to the standard [min, max] form.
+//
+// For antimeridian-crossing countries (USA), the largest gap is somewhere
+// inside the sorted list — the empty Pacific from the East Coast to the
+// Aleutians. The complement is expressed by adding 360° to the smaller
+// longitude so the returned bounds satisfy minLng < maxLng. fitBounds
+// receiving e.g. [_, 172] to [_, 293] centers the map at 232.5°, which
+// worldCopyJump then resolves to -127.5° — physical center of USA.
+//
+// INVARIANT (relied on downstream): maxLng - minLng <= 360. This holds
+// because maxLng - minLng = 360 - bestGap and bestGap is in [0, 360].
+const computeWrappedBounds = (geom: GeoJSON.Geometry): L.LatLngBounds => {
+  const lngs: number[] = [];
+  const lats: number[] = [];
+  const collect = (g: GeoJSON.Geometry) => {
+    if (g.type === 'Polygon') {
+      for (const ring of g.coordinates) {
+        for (const [lng, lat] of ring) {
+          lngs.push(lng);
+          lats.push(lat);
+        }
+      }
+    } else if (g.type === 'MultiPolygon') {
+      for (const poly of g.coordinates) {
+        for (const ring of poly) {
+          for (const [lng, lat] of ring) {
+            lngs.push(lng);
+            lats.push(lat);
+          }
+        }
+      }
+    }
+  };
+  collect(geom);
+
+  if (lngs.length === 0) {
+    return L.latLngBounds([0, 0], [0, 0]);
+  }
+
+  let minLat = Infinity, maxLat = -Infinity;
+  for (const lat of lats) {
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+  }
+
+  // Sort longitudes ascending. For Russia (~100k vertices on the full-
+  // precision polygon) this is the dominant cost of the function — modern
+  // V8 sorts 100k floats in roughly 30-50 ms, acceptable for a one-shot
+  // zoom action. The result is not cached; if it ever shows up as a hot
+  // path we can memoize per code.
+  const sorted = [...lngs].sort((a, b) => a - b);
+  const n = sorted.length;
+
+  // Find the largest gap. bestGapAfter = i means the gap is between
+  // sorted[i] and sorted[i+1] (or, when i === n-1, the wrap-around gap
+  // from sorted[n-1] back to sorted[0] + 360).
+  let bestGap = -1;
+  let bestGapAfter = n - 1;
+  for (let i = 0; i < n - 1; i++) {
+    const gap = sorted[i + 1] - sorted[i];
+    if (gap > bestGap) {
+      bestGap = gap;
+      bestGapAfter = i;
+    }
+  }
+  const wrapGap = sorted[0] + 360 - sorted[n - 1];
+  if (wrapGap > bestGap) {
+    bestGap = wrapGap;
+    bestGapAfter = n - 1;
+  }
+
+  let minLng: number, maxLng: number;
+  if (bestGapAfter === n - 1) {
+    // Wrap gap is largest: polygon does not cross the antimeridian.
+    minLng = sorted[0];
+    maxLng = sorted[n - 1];
+  } else {
+    // Largest gap is inside the sorted list: polygon crosses the
+    // antimeridian. The complement runs from sorted[bestGapAfter+1]
+    // east across ±180 to sorted[bestGapAfter]. Express by adding
+    // 360 to sorted[bestGapAfter] so minLng < maxLng numerically.
+    minLng = sorted[bestGapAfter + 1];
+    maxLng = sorted[bestGapAfter] + 360;
+  }
+
+  return L.latLngBounds([minLat, minLng], [maxLat, maxLng]);
+};
+
+// Hover-target simplification tolerance, in degrees of lat/lon. ~0.01° is
+// roughly 1 km at the equator. Way below one screen pixel at world zoom
+// (each pixel ≈ 40 km there), and the hit-target polygons are invisible
+// anyway — what matters is that the point-in-polygon boundary stays close
+// enough to the real coastline that the hover behaves intuitively. The
+// visible green border continues to use the full-precision file. Tunable.
+const HOVER_SIMPLIFY_TOLERANCE_DEG = 0.01;
+
+// Iterative Douglas-Peucker on an open polyline. Operates in raw lat/lon
+// degree space, comparing squared perpendicular distances to skip a sqrt
+// per point. Iterative (with an explicit stack) rather than recursive so
+// huge rings — Russia's coastline has ~100k vertices — don't blow the
+// JS engine's recursion limit.
+const dpSimplifyOpenPath = (
+  points: number[][],
+  toleranceSq: number,
+): number[][] => {
+  if (points.length < 3) return points.slice();
+  const keep = new Uint8Array(points.length);
+  keep[0] = 1;
+  keep[points.length - 1] = 1;
+  const stack: [number, number][] = [[0, points.length - 1]];
+  while (stack.length > 0) {
+    const [first, last] = stack.pop()!;
+    if (last - first < 2) continue;
+    const ax = points[first][0], ay = points[first][1];
+    const bx = points[last][0], by = points[last][1];
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    let maxDistSq = 0;
+    let maxIdx = -1;
+    for (let i = first + 1; i < last; i++) {
+      const px = points[i][0], py = points[i][1];
+      let distSq: number;
+      if (lenSq === 0) {
+        const ex = px - ax, ey = py - ay;
+        distSq = ex * ex + ey * ey;
+      } else {
+        const t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+        const tc = t < 0 ? 0 : t > 1 ? 1 : t;
+        const cx = ax + tc * dx, cy = ay + tc * dy;
+        const ex = px - cx, ey = py - cy;
+        distSq = ex * ex + ey * ey;
+      }
+      if (distSq > maxDistSq) {
+        maxDistSq = distSq;
+        maxIdx = i;
+      }
+    }
+    if (maxDistSq > toleranceSq && maxIdx !== -1) {
+      keep[maxIdx] = 1;
+      stack.push([first, maxIdx]);
+      stack.push([maxIdx, last]);
+    }
+  }
+  const result: number[][] = [];
+  for (let i = 0; i < points.length; i++) {
+    if (keep[i]) result.push(points[i]);
+  }
+  return result;
+};
+
+// Simplify a closed ring. Two-anchor strategy: find the vertex furthest
+// from ring[0], use it as the second anchor, run DP on each half. Treating
+// a closed ring as an open path with identical endpoints would degenerate
+// (line of length 0) and over-simplify the start/end region.
+const simplifyRing = (
+  ring: number[][],
+  toleranceSq: number,
+): number[][] => {
+  const n = ring.length;
+  if (n < 5) return ring.slice();
+  const ax = ring[0][0], ay = ring[0][1];
+  let maxDistSq = 0, maxIdx = 1;
+  for (let i = 1; i < n - 1; i++) {
+    const dx = ring[i][0] - ax, dy = ring[i][1] - ay;
+    const d = dx * dx + dy * dy;
+    if (d > maxDistSq) { maxDistSq = d; maxIdx = i; }
+  }
+  const part1 = dpSimplifyOpenPath(ring.slice(0, maxIdx + 1), toleranceSq);
+  const part2 = dpSimplifyOpenPath(ring.slice(maxIdx), toleranceSq);
+  const out = part1.concat(part2.slice(1));
+  // Ensure the output ring is closed (Leaflet/GeoJSON requires this).
+  if (out.length >= 3) {
+    const f = out[0], l = out[out.length - 1];
+    if (f[0] !== l[0] || f[1] !== l[1]) out.push([f[0], f[1]]);
+  }
+  return out;
+};
+
+const countCoords = (geom: GeoJSON.Geometry): number => {
+  let n = 0;
+  if (geom.type === 'Polygon') {
+    for (const ring of geom.coordinates) n += ring.length;
+  } else if (geom.type === 'MultiPolygon') {
+    for (const poly of geom.coordinates) {
+      for (const ring of poly) n += ring.length;
+    }
+  }
+  return n;
+};
+
+// Simplify a Polygon or MultiPolygon. Rings that collapse below 4 vertices
+// are dropped; sub-polygons whose outer ring collapses are dropped entirely.
+// The collapse rule means very small holes (e.g. Vatican-shaped holes in
+// Italy) may disappear at aggressive tolerances — at HOVER_SIMPLIFY_TOLERANCE_DEG
+// = 0.01° this is fine for everything bigger than ~1 km across.
+const simplifyGeometry = (
+  geom: GeoJSON.Geometry,
+  tolerance: number,
+): GeoJSON.Geometry => {
+  const tolSq = tolerance * tolerance;
+  if (geom.type === 'Polygon') {
+    const rings = geom.coordinates
+      .map((r) => simplifyRing(r as number[][], tolSq))
+      .filter((r) => r.length >= 4);
+    return { type: 'Polygon', coordinates: rings as GeoJSON.Position[][] };
+  }
+  if (geom.type === 'MultiPolygon') {
+    const polys = geom.coordinates
+      .map((poly) =>
+        poly
+          .map((r) => simplifyRing(r as number[][], tolSq))
+          .filter((r) => r.length >= 4),
+      )
+      .filter((poly) => poly.length > 0);
+    return {
+      type: 'MultiPolygon',
+      coordinates: polys as GeoJSON.Position[][][],
+    };
+  }
+  return geom;
+};
+
+// Modular shift: map a single longitude into [minLng, minLng + 360) by
+// subtracting the right multiple of 360. Used at fetch time to put every
+// vertex of an antimeridian-crossing polygon into a single contiguous
+// longitude range.
+const shiftLng = (lng: number, minLng: number): number =>
+  lng - 360 * Math.floor((lng - minLng) / 360);
+
+// Modular shift, applied to every vertex of a Polygon/MultiPolygon. For
+// an antimeridian-crossing country whose bounds extend past +180° (USA at
+// [144.6, 295.4]), this places the antimeridian-side vertices on a single
+// contiguous longitude range — Aleutians stay at +172°, mainland's -67°
+// becomes +293°. The polygon's natural drawing path no longer crosses
+// ±180° anywhere; the antimeridian discontinuity is gone.
+const shiftGeometryLngs = (
+  geom: GeoJSON.Geometry,
+  minLng: number,
+): GeoJSON.Geometry => {
+  if (geom.type === 'Polygon') {
+    return {
+      type: 'Polygon',
+      coordinates: geom.coordinates.map((ring) =>
+        ring.map(([lng, lat]) => [shiftLng(lng, minLng), lat]),
+      ) as GeoJSON.Position[][],
+    };
+  }
+  if (geom.type === 'MultiPolygon') {
+    return {
+      type: 'MultiPolygon',
+      coordinates: geom.coordinates.map((poly) =>
+        poly.map((ring) =>
+          ring.map(([lng, lat]) => [shiftLng(lng, minLng), lat]),
+        ),
+      ) as GeoJSON.Position[][][],
+    };
+  }
+  return geom;
+};
+
+// Uniform additive shift: add `offset` (a number, typically a multiple of
+// 360) to every longitude. Distinct from the modular shiftGeometryLngs
+// above — this one does NOT clamp into a 360°-wide window. Used at render
+// time to translate a contiguous-form polygon into the correct viewport
+// position.
+const translateGeometryLng = (
+  geom: GeoJSON.Geometry,
+  offset: number,
+): GeoJSON.Geometry => {
+  if (offset === 0) return geom;
+  if (geom.type === 'Polygon') {
+    return {
+      type: 'Polygon',
+      coordinates: geom.coordinates.map((ring) =>
+        ring.map(([lng, lat]) => [lng + offset, lat]),
+      ) as GeoJSON.Position[][],
+    };
+  }
+  if (geom.type === 'MultiPolygon') {
+    return {
+      type: 'MultiPolygon',
+      coordinates: geom.coordinates.map((poly) =>
+        poly.map((ring) =>
+          ring.map(([lng, lat]) => [lng + offset, lat]),
+        ),
+      ) as GeoJSON.Position[][][],
+    };
+  }
+  return geom;
+};
+
+// Wrap a single bare Polygon/MultiPolygon in a minimal FeatureCollection
+// so it can be passed straight to L.geoJSON. The HPSCU properties from
+// the original file are deliberately dropped — they're irrelevant for
+// rendering and dropping them avoids deep-copying the metadata blob.
+const featureCollectionOf = (
+  geom: GeoJSON.Geometry,
+): GeoJSON.FeatureCollection => ({
+  type: 'FeatureCollection',
+  features: [{ type: 'Feature', properties: {}, geometry: geom }],
+});
+
+// Given a polygon's contiguous-form bounds [polyMin, polyMax] and the
+// map's current viewport longitude range [viewLeft, viewRight], return
+// the set of offsets (multiples of 360) at which the polygon should be
+// rendered to fully cover its visible portion of the viewport.
+//
+// For a viewport that's a strict subset of one world (viewWidth < 360),
+// returns 0 or 1 offsets if the polygon is entirely inside or outside the
+// viewport, or 2 offsets when the polygon "wraps" across the viewport —
+// e.g. at min zoom panned so USA is half on the east edge and half on the
+// west edge.
+//
+// At min zoom (viewWidth = 360), an antimeridian-crossing polygon like
+// USA always returns 2 offsets: one places mainland in view, the other
+// places the Aleutians in view. A non-crosser like France returns 1.
+//
+// Algorithm:
+//   1. Anchor candidate baseOffset such that polyMin + baseOffset lands
+//      in [viewLeft, viewLeft + 360). For non-crossers this is typically
+//      the offset that places the polygon at its natural geographic
+//      position; for crossers this is the offset that places polyMin (the
+//      west edge of the contiguous form) into the viewport's first cycle.
+//   2. Test three candidate offsets — baseOffset - 360, baseOffset, and
+//      baseOffset + 360 — for whether the polygon under that offset
+//      overlaps the viewport. Keep the ones that do.
+// Three candidates suffices because polygon span and viewport span are
+// each <= 360, so at most two consecutive offsets can produce an
+// overlapping copy.
+const placeForView = (
+  bounds: L.LatLngBounds,
+  viewLeft: number,
+  viewRight: number,
+): number[] => {
+  const polyMin = bounds.getWest();
+  const polyMax = bounds.getEast();
+  const baseOffset = 360 * Math.ceil((viewLeft - polyMin) / 360);
+  const offsets: number[] = [];
+  for (const candidate of [baseOffset - 360, baseOffset, baseOffset + 360]) {
+    const left = polyMin + candidate;
+    const right = polyMax + candidate;
+    if (right >= viewLeft && left <= viewRight) {
+      offsets.push(candidate);
+    }
+  }
+  return offsets;
+};
+
+// Read the map's current viewport longitude range. Returns [west, east]
+// with east - west <= 360 (the viewport never spans more than one world).
+// At min zoom east - west = 360 exactly; at higher zooms it's smaller.
+const getViewportLngRange = (map: L.Map): [number, number] => {
+  const b = map.getBounds();
+  return [b.getWest(), b.getEast()];
+};
+
+// Render-time layer cache key. Each (code, offset) pair gets its own
+// cached L.GeoJSON layer — building one is cheap once the geometry is
+// in memory but non-trivial (Leaflet parses GeoJSON, builds SVG paths),
+// so we keep them around across attach/detach cycles.
+const layerKey = (code: string, offset: number): string =>
+  `${code}@${offset}`;
 
 export default function MapCanvas() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
+  const treeIndexRef = useRef<TreeIndex | null>(null);
 
+  // ─── Per-polygon static data (one entry per code, written once at fetch) ───
+  //
+  // boundsByCodeRef:
+  //   The polygon's wrapped bounds, computed via the largest-gap algorithm.
+  //   For non-crossers this is the standard [min, max]; for crossers (USA,
+  //   Russia, Fiji, Alaska) east > 180, packaging the full extent into a
+  //   single contiguous interval. Read by placeForView at render time and
+  //   by tryZoom for fitBounds.
+  //
+  // contiguousGeomByCodeRef:
+  //   The polygon shifted into [polyMin, polyMax] = a single contiguous
+  //   representation. For non-crossers this is identity; for crossers, the
+  //   antimeridian-side vertices get +360'd into the range, eliminating
+  //   the ±180° discontinuity. This is the canonical render-source for
+  //   the visible green border layer; translate by an offset (multiple of
+  //   360) to place at any viewport position.
+  //
+  // contiguousSimpleGeomByCodeRef:
+  //   Same shape as contiguousGeomByCodeRef but Douglas-Peucker simplified
+  //   at HOVER_SIMPLIFY_TOLERANCE_DEG. Used by the invisible hit-target
+  //   layer where sub-pixel boundary deviation is imperceptible and the
+  //   reduced vertex count substantially speeds up point-in-polygon.
+  const boundsByCodeRef = useRef<Map<string, L.LatLngBounds>>(new Map());
+  const contiguousGeomByCodeRef = useRef<Map<string, GeoJSON.Geometry>>(
+    new Map(),
+  );
+  const contiguousSimpleGeomByCodeRef = useRef<
+    Map<string, GeoJSON.Geometry>
+  >(new Map());
+
+  // In-flight fetch promises by code, to dedupe concurrent loads.
+  const inflightByCodeRef = useRef<Map<string, Promise<void>>>(new Map());
+
+  // ─── Render-time Leaflet layers, keyed by (code, offset) ───
+  //
+  // cachedTargetsByKeyRef / cachedBordersByKeyRef:
+  //   Build cache. Once a layer is parsed by Leaflet at a given offset
+  //   it stays here forever — re-attach is cheap, re-parse is not. Key
+  //   is `${code}@${offset}` (see layerKey). A given polygon typically
+  //   has 1–3 distinct offsets used over a session.
+  //
+  // attachedTargetsByCodeRef / attachedBordersByCodeRef:
+  //   What's currently on the map. Outer key: code. Inner: offset → layer
+  //   instance (same instance as the one in the corresponding cache).
+  //   Maintained by the reconcile* helpers below.
+  const cachedTargetsByKeyRef = useRef<Map<string, L.GeoJSON>>(new Map());
+  const cachedBordersByKeyRef = useRef<Map<string, L.GeoJSON>>(new Map());
+  const attachedTargetsByCodeRef = useRef<
+    Map<string, Map<number, L.GeoJSON>>
+  >(new Map());
+  const attachedBordersByCodeRef = useRef<
+    Map<string, Map<number, L.GeoJSON>>
+  >(new Map());
+
+  // Path: array of codes from World down to current selection.
+  const [path, setPath] = useState<string[]>(['000']);
+  const [hoveredCode, setHoveredCode] = useState<string | null>(null);
+
+  const pathRef = useRef(path);
+  const hoveredCodeRef = useRef(hoveredCode);
+  useEffect(() => {
+    pathRef.current = path;
+  }, [path]);
+  useEffect(() => {
+    hoveredCodeRef.current = hoveredCode;
+  }, [hoveredCode]);
+
+  // Map initialization.
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
     const container = containerRef.current;
 
-    // Smallest zoom where the map covers the viewport in BOTH dimensions.
-    // The map is square in Mercator (map width = map height at any zoom),
-    // so we size it off the longer viewport dimension. On a tall/skinny
-    // viewport this means you see less than 360° at a time and must pan
-    // horizontally to see more — but the canvas is always covered.
     const computeMinZoom = (width: number, height: number) =>
       Math.log2(Math.max(width, height) / 512) + 1;
 
@@ -52,8 +578,6 @@ export default function MapCanvas() {
     const SOUTH_LIMIT = -85.051;
     let adjusting = false;
 
-    // Rule 1: map's north edge never sits below viewport top.
-    // Rule 2: map's south edge never sits above viewport bottom.
     const enforceConstraints = () => {
       if (adjusting) return;
       const northPixelY = map.latLngToContainerPoint([NORTH_LIMIT, 0]).y;
@@ -70,10 +594,6 @@ export default function MapCanvas() {
       }
     };
 
-    // Background blue-to-white split follows a line 3/4 of the way down
-    // the map (≈ latitude -66°, the Antarctic Circle). This line exists
-    // only as a mental model — it's the seam behind the map that the body
-    // gradient uses so fallback color behind loading tiles stays plausible.
     const updateBackground = () => {
       const northPixelY = map.latLngToContainerPoint([NORTH_LIMIT, 0]).y;
       const southPixelY = map.latLngToContainerPoint([SOUTH_LIMIT, 0]).y;
@@ -103,7 +623,31 @@ export default function MapCanvas() {
     map.on('zoomend', onMapChange);
     onMapChange();
 
-    // Wheel: plain = pan vertically. Ctrl/Cmd = zoom at cursor.
+    // ─── View-settled handler: reconcile per-(code, offset) layers ───
+    //
+    // Fires after pan/zoom completes. For each currently-attached code
+    // (border or target), recompute which offsets should be rendered for
+    // the new viewport and adjust attached layers accordingly. Codes that
+    // aren't currently attached are NOT touched here — those are the
+    // responsibility of the path/hover effects, which fetch geometry if
+    // needed and call reconcile when ready.
+    //
+    // We listen on moveend AND zoomend because a zoom-with-pan-component
+    // can fire only one or the other depending on Leaflet internals; the
+    // reconcile is idempotent so the occasional duplicate is harmless.
+    const onViewSettled = () => {
+      if (!mapRef.current) return;
+      const [viewLeft, viewRight] = getViewportLngRange(mapRef.current);
+      for (const code of attachedTargetsByCodeRef.current.keys()) {
+        reconcileTargetsForCode(code, viewLeft, viewRight);
+      }
+      for (const code of attachedBordersByCodeRef.current.keys()) {
+        reconcileBordersForCode(code, viewLeft, viewRight);
+      }
+    };
+    map.on('moveend', onViewSettled);
+    map.on('zoomend', onViewSettled);
+
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
       if (e.ctrlKey || e.metaKey) {
@@ -128,6 +672,16 @@ export default function MapCanvas() {
     };
     window.addEventListener('resize', handleResize);
 
+    map.on('click', () => {
+      setPath((current) => {
+        if (current.length > 1) return current.slice(0, -1);
+        // Already at World. Return a NEW ['000'] reference so React
+        // re-runs the path useEffect, which fires the max-expand setView.
+        // (Returning `current` would short-circuit the state update.)
+        return ['000'];
+      });
+    });
+
     mapRef.current = map;
 
     return () => {
@@ -138,14 +692,680 @@ export default function MapCanvas() {
     };
   }, []);
 
+  // CSS injection.
+  useEffect(() => {
+    const styleEl = document.createElement('style');
+    styleEl.textContent = `
+      .scr-target {
+        pointer-events: all;
+        cursor: pointer;
+      }
+      .scr-border {
+        pointer-events: none;
+      }
+      .scr-target:focus, .scr-border:focus {
+        outline: none;
+      }
+    `;
+    document.head.appendChild(styleEl);
+    return () => {
+      if (styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
+    };
+  }, []);
+
+  // ESC pops one level off the path. At the World level, ESC re-fires
+  // the max-expand by returning a new ['000'] array reference.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      setPath((current) => {
+        if (current.length > 1) return current.slice(0, -1);
+        return ['000'];
+      });
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // Tree load. After tree is ready, ensure the World's children (Areas)
+  // have targets on the map. This is the world-view default.
+  useEffect(() => {
+    let stillMounted = true;
+
+    fetch('/data/tree.json')
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((tree: TreeNode) => {
+        if (!stillMounted) return;
+        const idx = indexTree(tree);
+        treeIndexRef.current = idx;
+        const counts: Record<string, number> = {};
+        for (const node of idx.codeToNode.values()) {
+          counts[node.level] = (counts[node.level] || 0) + 1;
+        }
+        console.log('[SCR] tree.json loaded — node counts by level:', counts);
+
+        // Trigger first render: load Areas as targets.
+        if (mapRef.current) {
+          ensureTargetsForPath(['000']);
+        }
+      })
+      .catch((err) => {
+        if (!stillMounted) return;
+        console.error('[SCR] failed to load tree.json:', err);
+      });
+
+    return () => {
+      stillMounted = false;
+    };
+  }, []);
+
+  // Fetch the GeoJSON for a code, derive and cache its static
+  // representations: bounds, contiguous-form geometry, simplified
+  // contiguous-form geometry. Returns a promise that resolves when those
+  // caches are populated (or rejects on failure). Subsequent calls for
+  // the same code are deduped via inflightByCodeRef and short-circuit
+  // once the geometry is cached.
+  const fetchGeometry = (code: string): Promise<void> => {
+    if (contiguousGeomByCodeRef.current.has(code)) return Promise.resolve();
+    const inflight = inflightByCodeRef.current.get(code);
+    if (inflight) return inflight;
+
+    // Build the R2 path for this code. Code structure mirrors directory
+    // structure: '840' -> '840/840.geojson',
+    //            '840-006' -> '840/840-006/840-006.geojson',
+    //            '156-006-003' -> '156/156-006/156-006-003/156-006-003.geojson'
+    const parts = code.split('-');
+    const dirParts: string[] = [];
+    for (let i = 0; i < parts.length; i++) {
+      dirParts.push(parts.slice(0, i + 1).join('-'));
+    }
+    const url = `${BOUNDARIES_BASE}/${dirParts.join('/')}/${code}.geojson`;
+
+    const promise = fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((geojson: GeoJSON.GeoJSON) => {
+        const origGeom = extractGeometry(geojson);
+        if (!origGeom) throw new Error('no geometry');
+
+        // Compute and cache bounds. Largest-gap algorithm; for crossers
+        // east > 180. Invariant: maxLng - minLng <= 360 (relied on by
+        // the contiguous-form shift below and by placeForView at render
+        // time).
+        const bounds = computeWrappedBounds(origGeom);
+        boundsByCodeRef.current.set(code, bounds);
+        const polyMin = bounds.getWest();
+        const polyMax = bounds.getEast();
+
+        // Shift every vertex into [polyMin, polyMin + 360). Because the
+        // bounds invariant holds, every vertex lands in [polyMin,
+        // polyMax]. For non-crossers this is identity (vertices were
+        // already in range); for crossers the antimeridian-side
+        // vertices get +360'd, eliminating the ±180° jump and leaving
+        // a polygon whose natural drawing path no longer crosses
+        // anywhere. This is the canonical render-source form — at
+        // render time we translate it by some offset (multiple of 360,
+        // chosen by placeForView) to position it correctly in the
+        // current viewport.
+        const contiguousGeom = shiftGeometryLngs(origGeom, polyMin);
+        contiguousGeomByCodeRef.current.set(code, contiguousGeom);
+
+        // Simplify the contiguous form for the invisible hit-target layer.
+        //
+        // Note: we simplify AFTER the shift, not before. Simplifying the
+        // unshifted geometry of a crosser would feed Douglas-Peucker a
+        // shape with a giant apparent jump across ±180° (USA's Aleutians
+        // at +172° "jumping" to mainland at -67°, etc.) — an artifact of
+        // the coordinate representation rather than the real shape.
+        // Simplifying after the shift gives DP the natural contiguous
+        // shape, which is what we actually want a faithful low-resolution
+        // version of.
+        const t0 =
+          typeof performance !== 'undefined' ? performance.now() : 0;
+        const before = countCoords(contiguousGeom);
+        const simpleGeom = simplifyGeometry(
+          contiguousGeom,
+          HOVER_SIMPLIFY_TOLERANCE_DEG,
+        );
+        const after = countCoords(simpleGeom);
+        contiguousSimpleGeomByCodeRef.current.set(code, simpleGeom);
+
+        if (before >= 1000) {
+          const ms =
+            typeof performance !== 'undefined'
+              ? (performance.now() - t0).toFixed(1)
+              : '?';
+          const pct = ((1 - after / before) * 100).toFixed(1);
+          console.log(
+            `[SCR] simplified ${code}: ${before} → ${after} verts (${pct}% reduction, ${ms}ms)`,
+          );
+        }
+
+        // Diagnostic: log antimeridian crossers as we encounter them so
+        // we can verify the corpus matches expectations. After this
+        // refactor crossers and non-crossers go through identical
+        // handling — this log carries no semantic weight beyond
+        // observability. Span <= 200° guard distinguishes "crossers
+        // proper" (USA, Russia, Fiji, Alaska) from polygons that wrap
+        // most of the globe (Antarctica), where the bounds also have
+        // east > 180 but for a different reason.
+        if (polyMax > 180 && polyMax - polyMin <= 200) {
+          console.log(
+            `[SCR] antimeridian crosser: ${code} (bounds ${polyMin.toFixed(1)} to ${polyMax.toFixed(1)})`,
+          );
+        }
+      })
+      .catch((err) => {
+        console.error(`[SCR] fetch failed ${code}:`, err.message ?? err);
+        throw err;
+      })
+      .finally(() => {
+        inflightByCodeRef.current.delete(code);
+      });
+    inflightByCodeRef.current.set(code, promise);
+    return promise;
+  };
+
+  // ─── Layer builders, parametrized by viewport offset ──────────────────
+  //
+  // Each (code, offset) pair gets its own L.GeoJSON instance. Offset is
+  // applied as an additive longitude shift to the contiguous-form
+  // geometry before parsing. A code typically has 1–3 distinct offsets
+  // used over a session — they're built lazily on first need and cached
+  // in cachedTargetsByKeyRef / cachedBordersByKeyRef forever after.
+
+  const buildTargetLayerAt = (code: string, offset: number): L.GeoJSON | null => {
+    const baseGeom =
+      contiguousSimpleGeomByCodeRef.current.get(code) ??
+      contiguousGeomByCodeRef.current.get(code);
+    if (!baseGeom) return null;
+    const geom = translateGeometryLng(baseGeom, offset);
+    const layer = L.geoJSON(featureCollectionOf(geom), {
+      style: {
+        fillColor: 'black',
+        fillOpacity: 0,
+        color: 'black',
+        weight: 0,
+        className: 'scr-target',
+      },
+    });
+    layer.on({
+      mouseover: () => {
+        setHoveredCode(code);
+      },
+      mouseout: () => {
+        setHoveredCode((current) => (current === code ? null : current));
+      },
+      click: (e: L.LeafletMouseEvent) => {
+        L.DomEvent.stopPropagation(e);
+        const idx = treeIndexRef.current;
+        if (!idx) return;
+        const ancestry = idx.codeToAncestry.get(code);
+        if (!ancestry) return;
+        setPath((current) => {
+          if (current[current.length - 1] === code) return current;
+          return ancestry;
+        });
+      },
+    });
+    return layer;
+  };
+
+  const buildBorderLayerAt = (code: string, offset: number): L.GeoJSON | null => {
+    const baseGeom = contiguousGeomByCodeRef.current.get(code);
+    if (!baseGeom) return null;
+    // Color by administrative level — green for Areas (ADM0), yellow for
+    // Regions (ADM1), cyan for Sub-Regions (ADM2). The node lookup
+    // shouldn't fail in practice (codes only enter the desired set via
+    // tree-driven flows) but we fall back to Area-green defensively.
+    const node = treeIndexRef.current?.codeToNode.get(code);
+    const color = node
+      ? BORDER_COLOR_BY_LEVEL[node.level]
+      : BORDER_COLOR_BY_LEVEL.Area;
+    const geom = translateGeometryLng(baseGeom, offset);
+    return L.geoJSON(featureCollectionOf(geom), {
+      style: {
+        fillOpacity: 0,
+        color,
+        weight: BORDER_WEIGHT,
+        className: 'scr-border',
+      },
+      interactive: false,
+    });
+  };
+
+  const getOrBuildTargetLayerAt = (
+    code: string,
+    offset: number,
+  ): L.GeoJSON | null => {
+    const key = layerKey(code, offset);
+    const cached = cachedTargetsByKeyRef.current.get(key);
+    if (cached) return cached;
+    const fresh = buildTargetLayerAt(code, offset);
+    if (!fresh) return null;
+    cachedTargetsByKeyRef.current.set(key, fresh);
+    return fresh;
+  };
+
+  const getOrBuildBorderLayerAt = (
+    code: string,
+    offset: number,
+  ): L.GeoJSON | null => {
+    const key = layerKey(code, offset);
+    const cached = cachedBordersByKeyRef.current.get(key);
+    if (cached) return cached;
+    const fresh = buildBorderLayerAt(code, offset);
+    if (!fresh) return null;
+    cachedBordersByKeyRef.current.set(key, fresh);
+    return fresh;
+  };
+
+  // ─── Per-code reconciliation against the current viewport ─────────────
+  //
+  // Given a code that should be visible, ensure exactly the right set of
+  // (code, offset) layers are attached to the map. Detaches any attached
+  // offsets that are no longer in the desired set; attaches missing ones,
+  // building (or reusing cached) layer instances as needed.
+  //
+  // Caller must have ensured boundsByCodeRef.has(code) — these helpers
+  // short-circuit cleanly if not.
+
+  const reconcileTargetsForCode = (
+    code: string,
+    viewLeft: number,
+    viewRight: number,
+  ) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const bounds = boundsByCodeRef.current.get(code);
+    if (!bounds) return;
+
+    let attached = attachedTargetsByCodeRef.current.get(code);
+    if (!attached) {
+      attached = new Map();
+      attachedTargetsByCodeRef.current.set(code, attached);
+    }
+
+    const desiredOffsets = new Set(placeForView(bounds, viewLeft, viewRight));
+
+    // Detach offsets not in desired.
+    for (const [offset, layer] of [...attached]) {
+      if (!desiredOffsets.has(offset)) {
+        map.removeLayer(layer);
+        attached.delete(offset);
+      }
+    }
+
+    // Attach missing offsets.
+    for (const offset of desiredOffsets) {
+      if (attached.has(offset)) continue;
+      const layer = getOrBuildTargetLayerAt(code, offset);
+      if (!layer) continue;
+      layer.addTo(map);
+      attached.set(offset, layer);
+      // Possessions (Taiwan, PR, Guam, MNP, ASM, VIR) need to sit on top
+      // of their containers so clicks/hovers land on the possession
+      // rather than the surrounding country. SVG paint order = DOM
+      // order, last sibling on top; bringToFront moves the path to the
+      // end of the parent SVG group. Done after addTo so the path
+      // exists in the DOM by the time we reorder it.
+      if (POSSESSION_CODES.has(code)) {
+        layer.bringToFront();
+      }
+    }
+    // Re-bump every attached possession to the front, regardless of
+    // which code we're reconciling. The bringToFront inside the for
+    // loop only fires when the possession itself is being newly
+    // attached; a container that attaches LATER would otherwise end up
+    // at the end of DOM order (on top), shadowing the possession's hit
+    // target. Reasserting the invariant on every reconcile makes the
+    // ordering independent of fetch-completion order.
+    for (const possCode of POSSESSION_CODES) {
+      const possAttached = attachedTargetsByCodeRef.current.get(possCode);
+      if (!possAttached) continue;
+      for (const possLayer of possAttached.values()) {
+        possLayer.bringToFront();
+      }
+    }
+  };
+
+  const reconcileBordersForCode = (
+    code: string,
+    viewLeft: number,
+    viewRight: number,
+  ) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const bounds = boundsByCodeRef.current.get(code);
+    if (!bounds) return;
+
+    let attached = attachedBordersByCodeRef.current.get(code);
+    if (!attached) {
+      attached = new Map();
+      attachedBordersByCodeRef.current.set(code, attached);
+    }
+
+    const desiredOffsets = new Set(placeForView(bounds, viewLeft, viewRight));
+
+    for (const [offset, layer] of [...attached]) {
+      if (!desiredOffsets.has(offset)) {
+        map.removeLayer(layer);
+        attached.delete(offset);
+      }
+    }
+
+    for (const offset of desiredOffsets) {
+      if (attached.has(offset)) continue;
+      const layer = getOrBuildBorderLayerAt(code, offset);
+      if (!layer) continue;
+      layer.addTo(map);
+      attached.set(offset, layer);
+    }
+  };
+
+  // Detach every attached offset for a code and forget it. Used when a
+  // code leaves the desired set entirely (e.g. dropped from the path).
+  // The cached layer instances are kept so re-entering this code in the
+  // future doesn't have to re-parse.
+
+  const detachAllTargetsForCode = (code: string) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const attached = attachedTargetsByCodeRef.current.get(code);
+    if (!attached) return;
+    for (const layer of attached.values()) {
+      map.removeLayer(layer);
+    }
+    attachedTargetsByCodeRef.current.delete(code);
+  };
+
+  const detachAllBordersForCode = (code: string) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const attached = attachedBordersByCodeRef.current.get(code);
+    if (!attached) return;
+    for (const layer of attached.values()) {
+      map.removeLayer(layer);
+    }
+    attachedBordersByCodeRef.current.delete(code);
+  };
+
+  // Given a path, ensure the right set of target polygons is on the map.
+  // The desired set: children of every path node, EXCLUDING any path node
+  // itself.
+  // - World view (path = ['000']): children of World = all Areas.
+  // - Path = ['000', '840']: 232 Areas - USA + USA's 51 states. We drop
+  //   USA itself because the user is already inside it; keeping USA on
+  //   the map would create a hit-target sitting under all 51 states, and
+  //   in Leaflet 1.x clicks on layers in custom panes can fall through
+  //   to the underlying Area, masking the state click. (Hover works
+  //   fine in custom panes; click does not.)
+  // - Path = ['000', '840', '840-005']: 231 Areas + 50 states + Calif's
+  //   Sub-Regions. California itself dropped, USA itself dropped.
+  //
+  // Adds missing targets (fetching geometry as needed); removes detached
+  // codes entirely. Per-code offset reconciliation is delegated to
+  // reconcileTargetsForCode.
+  const ensureTargetsForPath = (currentPath: string[]) => {
+    const map = mapRef.current;
+    const idx = treeIndexRef.current;
+    if (!map || !idx) return;
+
+    const desired = computeDesiredFor(currentPath);
+    const [viewLeft, viewRight] = getViewportLngRange(map);
+
+    // Detach codes not in desired.
+    for (const code of [...attachedTargetsByCodeRef.current.keys()]) {
+      if (!desired.has(code)) {
+        detachAllTargetsForCode(code);
+      }
+    }
+
+    // Reconcile each desired code. If geometry is loaded, reconcile
+    // immediately; otherwise fetch and reconcile when ready.
+    for (const code of desired) {
+      if (boundsByCodeRef.current.has(code)) {
+        reconcileTargetsForCode(code, viewLeft, viewRight);
+      } else {
+        fetchGeometry(code)
+          .then(() => {
+            // Re-check after async: path may have changed during fetch.
+            const latestDesired = computeDesiredFor(pathRef.current);
+            if (!latestDesired.has(code)) return;
+            if (!mapRef.current) return;
+            const [vL, vR] = getViewportLngRange(mapRef.current);
+            reconcileTargetsForCode(code, vL, vR);
+          })
+          .catch(() => {
+            // Already logged in fetchGeometry.
+          });
+      }
+    }
+  };
+
+  // Compute the set of codes whose hit-targets should be on the map for
+  // the given path. Includes children of every path node, except for
+  // the path nodes themselves — we don't want a redundant hit-target
+  // sitting under its own descendants where it can swallow clicks.
+  const computeDesiredFor = (currentPath: string[]): Set<string> => {
+    const desired = new Set<string>();
+    const idx = treeIndexRef.current;
+    if (!idx) return desired;
+    const pathSet = new Set(currentPath);
+    for (const code of currentPath) {
+      const node = idx.codeToNode.get(code);
+      if (!node) continue;
+      for (const child of node.children ?? []) {
+        if (pathSet.has(child.code)) continue;
+        desired.add(child.code);
+      }
+    }
+    return desired;
+  };
+
+  // When path changes:
+  //   1. Update target set (add deeper, remove popped).
+  //   2. Zoom to fit the new deepest selection. For World, max-expand
+  //      back to the initial centered, fully-zoomed-out view.
+  //
+  // The fitBounds animation will fire moveend at completion, which the
+  // onViewSettled handler installed in the map-init effect picks up to
+  // re-reconcile every attached code's offsets against the new viewport.
+  useEffect(() => {
+    ensureTargetsForPath(path);
+
+    const map = mapRef.current;
+    if (!map) return;
+
+    const deepest = path[path.length - 1];
+    if (deepest === '000') {
+      // Max-expand. Same view as initial page load: centered slightly
+      // above the equator, zoomed to the minimum that still keeps the
+      // map filling the viewport. Triggered every time the path
+      // resolves to ['000'] — including ESC and ocean clicks that pop
+      // back up to World, since their callers always set a new array
+      // reference rather than the same one.
+      map.setView([20, 0], Math.max(2, map.getMinZoom()), {
+        animate: true,
+        duration: 0.4,
+      });
+      return;
+    }
+
+    // Geometry might still be loading; if so, schedule when ready.
+    const tryZoom = () => {
+      const bounds = boundsByCodeRef.current.get(deepest);
+      if (!bounds || !bounds.isValid()) return false;
+      map.fitBounds(bounds, {
+        padding: [60, 60],
+        animate: true,
+        duration: 0.4,
+      });
+      return true;
+    };
+
+    if (!tryZoom()) {
+      fetchGeometry(deepest)
+        .then(() => {
+          // Re-check path; user may have already navigated away.
+          if (pathRef.current[pathRef.current.length - 1] === deepest) {
+            tryZoom();
+          }
+        })
+        .catch(() => {});
+    }
+  }, [path]);
+
+  // Render border overlays in response to path/hover changes.
+  // Borders to draw:
+  //   - Every path node except World
+  //   - The hovered code, if it's not already in the path
+  //
+  // Per-code offset reconciliation against the current viewport is
+  // delegated to reconcileBordersForCode. The view-settled handler in
+  // the map-init effect handles offset changes from pan/zoom; this
+  // effect handles adds/removes from path/hover changes.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const desired = new Set<string>();
+    for (let i = 1; i < path.length; i++) desired.add(path[i]);
+    if (hoveredCode && hoveredCode !== '000' && !path.includes(hoveredCode)) {
+      desired.add(hoveredCode);
+    }
+
+    const [viewLeft, viewRight] = getViewportLngRange(map);
+
+    // Detach codes not in desired.
+    for (const code of [...attachedBordersByCodeRef.current.keys()]) {
+      if (!desired.has(code)) {
+        detachAllBordersForCode(code);
+      }
+    }
+
+    // Reconcile each desired code, fetching geometry if needed.
+    for (const code of desired) {
+      if (boundsByCodeRef.current.has(code)) {
+        reconcileBordersForCode(code, viewLeft, viewRight);
+      } else {
+        fetchGeometry(code)
+          .then(() => {
+            // Re-check: path/hover may have changed during fetch.
+            const latestPath = pathRef.current;
+            const latestHover = hoveredCodeRef.current;
+            const latestDesired = new Set<string>();
+            for (let i = 1; i < latestPath.length; i++) {
+              latestDesired.add(latestPath[i]);
+            }
+            if (
+              latestHover &&
+              latestHover !== '000' &&
+              !latestPath.includes(latestHover)
+            ) {
+              latestDesired.add(latestHover);
+            }
+            if (!latestDesired.has(code)) return;
+            if (!mapRef.current) return;
+            const [vL, vR] = getViewportLngRange(mapRef.current);
+            reconcileBordersForCode(code, vL, vR);
+          })
+          .catch(() => {});
+      }
+    }
+  }, [path, hoveredCode]);
+
   return (
-    <div
-      ref={containerRef}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        zIndex: 0,
-      }}
-    />
+    <>
+      <div
+        ref={containerRef}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          zIndex: 0,
+        }}
+      />
+      {/* Breadcrumb. Each segment is a button that calls setPath with
+          a prefix of the current path. Clicking the current deepest
+          segment re-fires zoom-to-fit by giving setPath a fresh array.
+          Container has pointerEvents: none so the map underneath is
+          still clickable around the buttons; each button re-enables
+          pointerEvents on itself. */}
+      <nav
+        aria-label="Path"
+        style={{
+          position: 'fixed',
+          top: 16,
+          left: 16,
+          zIndex: 1000,
+          pointerEvents: 'none',
+          display: 'flex',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: 6,
+          fontFamily:
+            'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontSize: 14,
+        }}
+      >
+        {path.map((code, i) => {
+          let label: string;
+          if (code === '000') {
+            label = 'World';
+          } else {
+            const node = treeIndexRef.current?.codeToNode.get(code);
+            label = node?.display_name ?? node?.name ?? code;
+          }
+          const isLast = i === path.length - 1;
+          return (
+            <span
+              key={code}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              <button
+                type="button"
+                aria-current={isLast ? 'page' : undefined}
+                onClick={() => setPath(path.slice(0, i + 1))}
+                style={{
+                  pointerEvents: 'auto',
+                  background: 'rgba(0, 0, 0, 0.55)',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 4,
+                  padding: '6px 10px',
+                  cursor: 'pointer',
+                  fontSize: 'inherit',
+                  fontFamily: 'inherit',
+                  fontWeight: isLast ? 600 : 400,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {label}
+              </button>
+              {!isLast && (
+                <span
+                  aria-hidden="true"
+                  style={{
+                    color: '#fff',
+                    textShadow: '0 1px 2px rgba(0, 0, 0, 0.6)',
+                  }}
+                >
+                  ›
+                </span>
+              )}
+            </span>
+          );
+        })}
+      </nav>
+    </>
   );
 }
