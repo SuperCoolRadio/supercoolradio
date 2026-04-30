@@ -485,6 +485,47 @@ const getViewportLngRange = (map: L.Map): [number, number] => {
   return [b.getWest(), b.getEast()];
 };
 
+// Smallest signed longitude displacement, normalized to [-180, 180].
+// `dx` is the raw difference between two longitudes; the return value is
+// the equivalent angle that takes the short way around the globe.
+// JavaScript's `%` returns a result with the dividend's sign, so we add
+// 360 and re-mod before subtracting 180 to handle negative inputs.
+const wrapLngDiff = (dx: number): number =>
+  ((dx + 180) % 360 + 360) % 360 - 180;
+
+// Shift bounds by a multiple of 360° so its center is the short way
+// around from the reference longitude. Same physical region of the
+// globe, just expressed in a different ±360° representation. Used so
+// that flyToBounds takes the direct route to the destination instead
+// of circling the world.
+//
+// The math: let `current` be the reference longitude (where the map
+// is now) and `target` be the bounds' center longitude (where it will
+// go). The smallest signed displacement is x = wrapLngDiff(target -
+// current); the destination center under the short-way path is
+// current + x. The shift to apply to the bounds equals (current + x) -
+// target, which is always 0 or ±360°.
+const shiftBoundsToNearest = (
+  bounds: L.LatLngBounds,
+  refLng: number,
+): L.LatLngBounds => {
+  const target = (bounds.getWest() + bounds.getEast()) / 2;
+  const x = wrapLngDiff(target - refLng);
+  const shift = (refLng + x) - target;
+  if (shift === 0) return bounds;
+  return L.latLngBounds(
+    [bounds.getSouth(), bounds.getWest() + shift],
+    [bounds.getNorth(), bounds.getEast() + shift],
+  );
+};
+
+// Shortest-way variant of flyTo's target longitude. Returns the
+// equivalent of `targetLng` that takes the short path from `refLng`.
+// Used by the World-case flyTo, where there is no bounds object —
+// just a fixed target lng of 0.
+const shiftLngToNearest = (targetLng: number, refLng: number): number =>
+  refLng + wrapLngDiff(targetLng - refLng);
+
 // Render-time layer cache key. Each (code, offset) pair gets its own
 // cached L.GeoJSON layer — building one is cheap once the geometry is
 // in memory but non-trivial (Leaflet parses GeoJSON, builds SVG paths),
@@ -1346,9 +1387,15 @@ export default function MapCanvas() {
       // resolves to ['000'] — including ESC and ocean clicks that pop
       // back up to World, since their callers always set a new array
       // reference rather than the same one.
-      map.setView([20, 0], Math.max(2, map.getMinZoom()), {
-        animate: true,
-        duration: 0.4,
+      // flyTo (not setView) is required to honor `duration`. setView's
+      // `duration` option is silently ignored when the zoom changes —
+      // Leaflet uses a fixed CSS transition for animated zooms. flyTo
+      // does an integrated zoom+pan with a real, configurable duration.
+      // Same short-path treatment as the country branch: pick the
+      // ±360° representation of lng=0 closest to the current center.
+      const targetLng = shiftLngToNearest(0, map.getCenter().lng);
+      map.flyTo([20, targetLng], Math.max(2, map.getMinZoom()), {
+        duration: 1.2,
       });
       return;
     }
@@ -1357,10 +1404,20 @@ export default function MapCanvas() {
     const tryZoom = () => {
       const bounds = boundsByCodeRef.current.get(deepest);
       if (!bounds || !bounds.isValid()) return false;
-      map.fitBounds(bounds, {
+      // Shift the bounds to the copy of the world nearest the current
+      // map center, so flyToBounds takes the short path. Without this,
+      // a contiguous-form crosser (e.g. USA's [144.6, 295.4]) seen from
+      // a current center near Canada at lng ~ -95 would animate +315
+      // east instead of -45 west. Same destination, much shorter trip.
+      const currentLng = map.getCenter().lng;
+      const shiftedBounds = shiftBoundsToNearest(bounds, currentLng);
+      // flyToBounds (not fitBounds) is required to honor `duration`.
+      // fitBounds delegates the zoom portion to a fixed-duration CSS
+      // transition, ignoring our `duration`. flyToBounds does an
+      // integrated zoom+pan with a real, configurable duration.
+      map.flyToBounds(shiftedBounds, {
         padding: [60, 60],
-        animate: true,
-        duration: 0.4,
+        duration: 1.2,
       });
       return true;
     };
