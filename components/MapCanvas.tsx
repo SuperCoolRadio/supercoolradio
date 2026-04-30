@@ -526,6 +526,22 @@ const shiftBoundsToNearest = (
 const shiftLngToNearest = (targetLng: number, refLng: number): number =>
   refLng + wrapLngDiff(targetLng - refLng);
 
+// Custom CRS: identical to the standard EPSG:3857 (Spherical Mercator)
+// except MAX_LATITUDE is raised from 85.0511° to 86°. SphericalMercator
+// clamps lat to ±MAX_LATITUDE before computing pixel y; with the default
+// clamp every Antarctica vertex past -85.0511° projects to a single y
+// value and renders as a horizontal seam at the visible south edge of
+// the map. Raising the clamp to 86° pushes that seam to lat=-86°, which
+// is below the pannable region (enforceConstraints holds the viewport
+// to ±85.051°), so the seam is off-screen. The map's panning extent and
+// rendered tile area are unchanged — this only affects where vertices
+// past the old clamp project to.
+const customCRS = L.Util.extend({}, L.CRS.EPSG3857, {
+  projection: L.Util.extend({}, L.Projection.SphericalMercator, {
+    MAX_LATITUDE: 86,
+  }),
+});
+
 // Render-time layer cache key. Each (code, offset) pair gets its own
 // cached L.GeoJSON layer — building one is cheap once the geometry is
 // in memory but non-trivial (Leaflet parses GeoJSON, builds SVG paths),
@@ -647,6 +663,7 @@ export default function MapCanvas() {
       zoomSnap: 0,
       wheelPxPerZoomLevel: 120,
       scrollWheelZoom: false,
+      crs: customCRS,
     });
 
     L.tileLayer('https://tiles.supercoolradio.com/tiles/{z}/{x}/{y}.webp', {
@@ -1370,9 +1387,20 @@ export default function MapCanvas() {
   //   2. Zoom to fit the new deepest selection. For World, max-expand
   //      back to the initial centered, fully-zoomed-out view.
   //
-  // The fitBounds animation will fire moveend at completion, which the
-  // onViewSettled handler installed in the map-init effect picks up to
-  // re-reconcile every attached code's offsets against the new viewport.
+  // For non-World destinations: full-resolution geometry must be in
+  // memory AND attached to the map AND painted to the screen before
+  // the fly animation starts. Otherwise iOS Safari briefly renders
+  // the border at the wrong y-position when an SVG path with tens of
+  // thousands of vertices (USA, Canada, Russia at HPSCU resolution)
+  // is added to the map mid-animation. The fix sequences the work:
+  // fetchGeometry → reconcileBordersForCode → two animation frames
+  // (one for layout, one for paint) → flyToBounds. ~32 ms of added
+  // latency at 60fps; imperceptible relative to the 1.2 s zoom.
+  //
+  // The flyToBounds animation will fire moveend at completion, which
+  // the onViewSettled handler installed in the map-init effect picks
+  // up to re-reconcile every attached code's offsets against the new
+  // viewport.
   useEffect(() => {
     ensureTargetsForPath(path);
 
@@ -1400,35 +1428,53 @@ export default function MapCanvas() {
       return;
     }
 
-    // Geometry might still be loading; if so, schedule when ready.
-    const tryZoom = () => {
-      const bounds = boundsByCodeRef.current.get(deepest);
-      if (!bounds || !bounds.isValid()) return false;
-      // Shift the bounds to the copy of the world nearest the current
-      // map center, so flyToBounds takes the short path. Without this,
-      // a contiguous-form crosser (e.g. USA's [144.6, 295.4]) seen from
-      // a current center near Canada at lng ~ -95 would animate +315
-      // east instead of -45 west. Same destination, much shorter trip.
-      const currentLng = map.getCenter().lng;
-      const shiftedBounds = shiftBoundsToNearest(bounds, currentLng);
-      // flyToBounds (not fitBounds) is required to honor `duration`.
-      // fitBounds delegates the zoom portion to a fixed-duration CSS
-      // transition, ignoring our `duration`. flyToBounds does an
-      // integrated zoom+pan with a real, configurable duration.
-      map.flyToBounds(shiftedBounds, {
-        padding: [60, 60],
-        duration: 1.2,
+    // Attach the border at full resolution, wait for paint, then fly.
+    // Re-checks the path at each async boundary so an in-flight
+    // sequence aborts cleanly if the user navigates away mid-fetch
+    // or mid-frame-wait.
+    const attachBorderAndFly = () => {
+      if (pathRef.current[pathRef.current.length - 1] !== deepest) return;
+      const m = mapRef.current;
+      if (!m) return;
+      const [vL, vR] = getViewportLngRange(m);
+      // Synchronously attach the full-resolution border. By this point
+      // contiguousGeomByCodeRef has the geometry (we awaited it above
+      // when not already cached), so reconcileBordersForCode builds
+      // and adds the layer immediately rather than going through its
+      // own deferred fetch path in the border useEffect.
+      reconcileBordersForCode(deepest, vL, vR);
+      // Two rAFs: first to commit the layer addition into a layout,
+      // second to ensure the browser has painted it. After both fire
+      // we know the border is on screen, and the fly animation can
+      // start without iOS Safari having to insert a complex SVG path
+      // mid-CSS-transform.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (pathRef.current[pathRef.current.length - 1] !== deepest) return;
+          const m2 = mapRef.current;
+          if (!m2) return;
+          const bounds = boundsByCodeRef.current.get(deepest);
+          if (!bounds || !bounds.isValid()) return;
+          const currentLng = m2.getCenter().lng;
+          const shiftedBounds = shiftBoundsToNearest(bounds, currentLng);
+          // flyToBounds (not fitBounds) is required to honor `duration`.
+          // fitBounds delegates the zoom portion to a fixed-duration CSS
+          // transition, ignoring our `duration`. flyToBounds does an
+          // integrated zoom+pan with a real, configurable duration.
+          m2.flyToBounds(shiftedBounds, {
+            padding: [60, 60],
+            duration: 1.2,
+          });
+        });
       });
-      return true;
     };
 
-    if (!tryZoom()) {
+    if (contiguousGeomByCodeRef.current.has(deepest)) {
+      attachBorderAndFly();
+    } else {
       fetchGeometry(deepest)
         .then(() => {
-          // Re-check path; user may have already navigated away.
-          if (pathRef.current[pathRef.current.length - 1] === deepest) {
-            tryZoom();
-          }
+          attachBorderAndFly();
         })
         .catch(() => {});
     }
