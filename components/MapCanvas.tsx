@@ -466,6 +466,24 @@ const getViewportLngRange = (map: L.Map): [number, number] => {
 const layerKey = (code: string, offset: number): string =>
   `${code}@${offset}`;
 
+// True iff the primary input is capable of true hover (desktop mouse,
+// laptop trackpad, Surface in laptop mode). False for phones and tablets
+// without a paired pointer. Touch browsers synthesize mouseover/mouseout
+// from gestures unreliably — sometimes from the finger position, sometimes
+// from where the gesture started, sometimes nowhere — and gating the
+// layer hover handlers on this flag eliminates the resulting phantom
+// highlights. Click is unaffected and keeps working on every device.
+//
+// Evaluated once at module load. The page is dynamically imported with
+// ssr: false (see app/page.tsx) so window is always defined here, but
+// the typeof guard is kept as cheap insurance. We don't listen for
+// (hover: hover) changes — switching primary input mid-session
+// (plugging in a Bluetooth mouse, removing a tablet from a keyboard
+// dock) is rare enough that a page reload is acceptable.
+const supportsHover =
+  typeof window !== 'undefined' &&
+  window.matchMedia('(hover: hover)').matches;
+
 export default function MapCanvas() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -672,15 +690,35 @@ export default function MapCanvas() {
     };
     window.addEventListener('resize', handleResize);
 
-    map.on('click', () => {
-      setPath((current) => {
-        if (current.length > 1) return current.slice(0, -1);
-        // Already at World. Return a NEW ['000'] reference so React
-        // re-runs the path useEffect, which fires the max-expand setView.
-        // (Returning `current` would short-circuit the state update.)
-        return ['000'];
+    // Map-level click handler — fires when a click reaches the map
+    // itself rather than a polygon hit-target (which calls
+    // L.DomEvent.stopPropagation in its own click handler). In practice
+    // this means: clicks on ocean, or on a path node whose hit-target
+    // has been detached because it's the current deepest selection.
+    //
+    // Desktop behavior (preserved): pop one path level, or — at World —
+    // return a fresh ['000'] reference to re-fire the max-expand setView
+    // (recentering and zooming all the way out).
+    //
+    // Mobile behavior (NEW, 2026-04-29): do nothing. Without a hover
+    // preview, the only way to discover whether a country has Regions
+    // is to tap it and see what happens. If the user is just shy of the
+    // country's edge and lands in ocean, popping a level — or worse,
+    // re-centering to the default world view at zoom-min — is a punishing
+    // accidental gesture. Mobile users navigate up via the breadcrumb
+    // instead. ESC isn't on phones, so we don't lose anything by not
+    // having an "ocean = back" gesture there.
+    if (supportsHover) {
+      map.on('click', () => {
+        setPath((current) => {
+          if (current.length > 1) return current.slice(0, -1);
+          // Already at World. Return a NEW ['000'] reference so React
+          // re-runs the path useEffect, which fires the max-expand setView.
+          // (Returning `current` would short-circuit the state update.)
+          return ['000'];
+        });
       });
-    });
+    }
 
     mapRef.current = map;
 
@@ -894,13 +932,39 @@ export default function MapCanvas() {
         className: 'scr-target',
       },
     });
+    // Hover handlers (NEW, 2026-04-29): only on devices whose primary
+    // input is capable of true hover — desktops, laptops, Surface in
+    // laptop mode. The check is the module-scope `supportsHover`
+    // (matchMedia '(hover: hover)'), evaluated once at load.
+    //
+    // Why we gate this: mobile browsers synthesize mouseover/mouseout
+    // events from touch gestures, but the position they're synthesized
+    // at is unreliable — sometimes the finger position, sometimes
+    // gesture-start, sometimes nowhere predictable. The result on
+    // SuperCoolRadio was phantom highlights: users would see a country
+    // light up that they hadn't aimed at and weren't touching (Hugh
+    // verified: highlighted Australia from the bottom half of the
+    // screen without ever touching the bottom half). Removing the
+    // hover handlers on no-hover devices eliminates this entirely
+    // and also kills a stream of pointless React re-renders during
+    // pans (each spurious mouseover/mouseout triggers setHoveredCode
+    // → border-rendering useEffect at the bottom of this component).
+    //
+    // Click is attached unconditionally below — touch-to-click
+    // synthesis IS reliable (every browser produces a click at the
+    // tap-up position, and Leaflet's Tap handler is well-tested), so
+    // the click pathway works on every device with no special casing.
+    if (supportsHover) {
+      layer.on({
+        mouseover: () => {
+          setHoveredCode(code);
+        },
+        mouseout: () => {
+          setHoveredCode((current) => (current === code ? null : current));
+        },
+      });
+    }
     layer.on({
-      mouseover: () => {
-        setHoveredCode(code);
-      },
-      mouseout: () => {
-        setHoveredCode((current) => (current === code ? null : current));
-      },
       click: (e: L.LeafletMouseEvent) => {
         L.DomEvent.stopPropagation(e);
         const idx = treeIndexRef.current;
