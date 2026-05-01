@@ -562,6 +562,100 @@ const customCRS = L.Util.extend({}, L.CRS.EPSG3857, {
   }),
 });
 
+// Polar-safe pannable lat limit. Camera viewport must stay within
+// [+POLAR_LIMIT, -POLAR_LIMIT]; below or above shows blue sky / white
+// ice. Matches the NORTH_LIMIT / SOUTH_LIMIT used by enforceConstraints.
+const POLAR_LIMIT = 85.051;
+
+// Compute a (center, zoom) target for the path-driven zoom-to-country
+// flow. Replaces flyToBounds with logic that respects two universal
+// map-display constraints, plus a box-aspect-dependent natural-fit
+// zoom.
+//
+// Universal constraints (must hold regardless of bounds):
+//   1. POLAR — world's pannable region (lat range [+POLAR_LIMIT,
+//      -POLAR_LIMIT]) must be at least as tall as the viewport, else
+//      sky/ice appears at top/bottom. Implies target_P ≥ H/pannableFrac.
+//   2. NO-DOUBLING — world width must be at least as wide as the
+//      viewport, else the world tiles into adjacent copies and
+//      content appears twice horizontally. Implies target_P ≥ W.
+//
+// Natural fit (depends on box aspect vs window aspect):
+//   - WIDER box (aspectBox ≥ aspectWin): fit box to window width
+//     → P_natural = Weff / widthFrac.
+//   - TALLER box (aspectBox <  aspectWin): fit box to window height
+//     → P_natural = Heff / heightFrac.
+//
+//   target_P = max(P_natural, P_polar, P_noDouble)
+//
+// When a universal constraint binds harder than the natural fit, the
+// box "shrinks" symmetrically about its center to fit the higher-zoom
+// viewport — the user sees only the central portion of the box but
+// the map fills the window correctly.
+//
+// Camera position:
+//   - Latitude:  as close to box center as possible, with viewport
+//     within [yPolarN, yPolarS]. When P_polar binds, the valid camera-y
+//     range collapses to a single point (pannable center), which the
+//     clamp returns regardless of box.
+//   - Longitude: box center (worldCopyJump handles wrap-around).
+const computePolarSafeFlyTarget = (
+  map: L.Map,
+  bounds: L.LatLngBounds,
+  viewportWidth: number,
+  viewportHeight: number,
+  paddingPx: number,
+): { center: L.LatLng; zoom: number } => {
+  const Weff = viewportWidth - 2 * paddingPx;
+  const Heff = viewportHeight - 2 * paddingPx;
+
+  // Project at zoom 0 → y / 256 = y-fraction.
+  const yProj0 = (lat: number) => map.project(L.latLng(lat, 0), 0).y;
+  const fPolarN = yProj0(POLAR_LIMIT) / 256;
+  const fPolarS = yProj0(-POLAR_LIMIT) / 256;
+  const fN = yProj0(bounds.getNorth()) / 256;
+  const fS = yProj0(bounds.getSouth()) / 256;
+  const pannableFrac = fPolarS - fPolarN; // ≈ 0.943
+
+  const widthFrac = (bounds.getEast() - bounds.getWest()) / 360;
+  const heightFrac = fS - fN;
+
+  const aspectBox =
+    heightFrac > 1e-9 ? widthFrac / heightFrac : Infinity;
+  const aspectWin = Weff / Heff;
+
+  const P_polar = viewportHeight / pannableFrac;
+  const P_noDouble = viewportWidth;
+  const P_natural =
+    aspectBox >= aspectWin
+      ? widthFrac > 1e-9
+        ? Weff / widthFrac
+        : 0
+      : heightFrac > 1e-9
+      ? Heff / heightFrac
+      : 0;
+
+  const targetP = Math.max(P_natural, P_polar, P_noDouble);
+  const targetZoom = Math.log2(targetP / 256);
+
+  // Camera lat: clamp to the valid range so the viewport stays within
+  // the pannable region.
+  const yPolarN_t = fPolarN * targetP;
+  const yPolarS_t = fPolarS * targetP;
+  const cyMin = yPolarN_t + viewportHeight / 2;
+  const cyMax = yPolarS_t - viewportHeight / 2;
+  const boundsCenterLat = (bounds.getNorth() + bounds.getSouth()) / 2;
+  const yBoundsCenter = map.project(
+    L.latLng(boundsCenterLat, 0),
+    targetZoom,
+  ).y;
+  const cyClamped = Math.max(cyMin, Math.min(cyMax, yBoundsCenter));
+  const targetLat = map.unproject(L.point(0, cyClamped), targetZoom).lat;
+  const targetLng = (bounds.getWest() + bounds.getEast()) / 2;
+
+  return { center: L.latLng(targetLat, targetLng), zoom: targetZoom };
+};
+
 // Render-time layer cache key. Each (code, offset) pair gets its own
 // cached L.GeoJSON layer — building one is cheap once the geometry is
 // in memory but non-trivial (Leaflet parses GeoJSON, builds SVG paths),
@@ -1622,8 +1716,48 @@ export default function MapCanvas() {
       // does an integrated zoom+pan with a real, configurable duration.
       // Same short-path treatment as the country branch: pick the
       // ±360° representation of lng=0 closest to the current center.
+      //
+      // Polar/no-doubling guard. The naive `Math.max(2, getMinZoom())`
+      // and a fixed lat=20 can fail on tall-and-skinny viewports:
+      //   - getMinZoom enforces world_height ≥ max(W, H), but
+      //     pannable_height = 0.943·world_height < world_height, so on
+      //     a portrait viewport the pannable region can be shorter
+      //     than H even at min zoom — body background bleeds through
+      //     at top and bottom.
+      //   - lat=20 places the camera north of the equator; on a tall
+      //     viewport this can put the viewport's top edge above
+      //     +POLAR_LIMIT, showing the body background through the gap.
+      // Floor the zoom at the polar/no-doubling minimum, then clamp
+      // lat=20 to the valid camera range at that zoom. The country
+      // branch uses the same approach via computePolarSafeFlyTarget.
+      const containerEl = containerRef.current;
+      if (!containerEl) return;
+      const Hfull = containerEl.offsetHeight;
+      const Wfull = containerEl.offsetWidth;
+      const yProj0 = (lat: number) =>
+        map.project(L.latLng(lat, 0), 0).y;
+      const fPolarN = yProj0(POLAR_LIMIT) / 256;
+      const fPolarS = yProj0(-POLAR_LIMIT) / 256;
+      const pannableFrac = fPolarS - fPolarN; // ≈ 0.943
+      const P_polar = Hfull / pannableFrac;
+      const P_noDouble = Wfull;
+      const minSafeZoom = Math.log2(
+        Math.max(P_polar, P_noDouble) / 256,
+      );
+      const targetZoom = Math.max(2, map.getMinZoom(), minSafeZoom);
+
+      const targetP = 256 * Math.pow(2, targetZoom);
+      const cyMin = fPolarN * targetP + Hfull / 2;
+      const cyMax = fPolarS * targetP - Hfull / 2;
+      const yLat20 = map.project(L.latLng(20, 0), targetZoom).y;
+      const cyClamped = Math.max(cyMin, Math.min(cyMax, yLat20));
+      const targetLat = map.unproject(
+        L.point(0, cyClamped),
+        targetZoom,
+      ).lat;
       const targetLng = shiftLngToNearest(0, map.getCenter().lng);
-      map.flyTo([20, targetLng], Math.max(2, map.getMinZoom()), {
+
+      map.flyTo([targetLat, targetLng], targetZoom, {
         duration: 1.2,
       });
       return;
@@ -1633,19 +1767,32 @@ export default function MapCanvas() {
     const tryZoom = () => {
       const bounds = boundsByCodeRef.current.get(deepest);
       if (!bounds || !bounds.isValid()) return false;
+      const containerEl = containerRef.current;
+      if (!containerEl) return false;
       // Shift the bounds to the copy of the world nearest the current
-      // map center, so flyToBounds takes the short path. Without this,
+      // map center, so the fly takes the short path. Without this,
       // a contiguous-form crosser (e.g. USA's [144.6, 295.4]) seen from
       // a current center near Canada at lng ~ -95 would animate +315
       // east instead of -45 west. Same destination, much shorter trip.
       const currentLng = map.getCenter().lng;
       const shiftedBounds = shiftBoundsToNearest(bounds, currentLng);
-      // flyToBounds (not fitBounds) is required to honor `duration`.
-      // fitBounds delegates the zoom portion to a fixed-duration CSS
-      // transition, ignoring our `duration`. flyToBounds does an
-      // integrated zoom+pan with a real, configurable duration.
-      map.flyToBounds(shiftedBounds, {
-        padding: [60, 60],
+      // Compute a polar-safe (center, zoom) target rather than calling
+      // flyToBounds directly. flyToBounds chooses a target by fitting
+      // the bounds, but for polar-extreme bounds (Antarctica, or
+      // Russia / Greenland on narrow viewports) the chosen camera
+      // position can extend past the polar pannable lat range, showing
+      // sky/ice. computePolarSafeFlyTarget floors the zoom at whatever
+      // value keeps the camera viewport within bounds, and clamps the
+      // center lat. flyTo (not setView/fitBounds) is required to honor
+      // `duration`.
+      const target = computePolarSafeFlyTarget(
+        map,
+        shiftedBounds,
+        containerEl.offsetWidth,
+        containerEl.offsetHeight,
+        60,
+      );
+      map.flyTo(target.center, target.zoom, {
         duration: 1.2,
       });
       return true;
