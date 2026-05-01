@@ -56,6 +56,26 @@ const BORDER_COLOR_BY_LEVEL: Record<TreeNode['level'], string> = {
 };
 const BORDER_WEIGHT = 2;
 
+// Helpers for toggling the scr-flying CSS class. The class is added
+// to BOTH the map container AND document.body during a fly. Body-level
+// is the load-bearing one — it makes CSS rules like
+// `body.scr-flying * { cursor: none }` apply to every element on the
+// page, regardless of nesting or specificity. Container-level is kept
+// for any rules scoped specifically inside the map. Both add/remove
+// in lockstep.
+const setFlyingActive = (containerEl: HTMLDivElement | null) => {
+  if (containerEl) containerEl.classList.add('scr-flying');
+  if (typeof document !== 'undefined') {
+    document.body.classList.add('scr-flying');
+  }
+};
+const setFlyingInactive = (containerEl: HTMLDivElement | null) => {
+  if (containerEl) containerEl.classList.remove('scr-flying');
+  if (typeof document !== 'undefined') {
+    document.body.classList.remove('scr-flying');
+  }
+};
+
 // Areas whose polygons sit inside another Area's polygon and would
 // otherwise be unclickable because the containing Area's invisible
 // hit-target sits on top. Per Partitioning Rule 5, these are the six
@@ -632,6 +652,16 @@ export default function MapCanvas() {
 
   const pathRef = useRef(path);
   const hoveredCodeRef = useRef(hoveredCode);
+  // Tracks whether a fly-to-country animation is currently in progress.
+  // Set synchronously in the path useEffect when a country fly is about
+  // to start; cleared in onViewSettled (moveend handler) once the
+  // animation completes. Used by the border useEffect to defer
+  // attachment of the deepest path code's border until after the zoom
+  // finishes. Otherwise iOS Safari briefly renders the border at the
+  // wrong y-position when an SVG path with tens of thousands of
+  // vertices (USA, Canada, Russia at HPSCU resolution) is added to the
+  // map mid-flyToBounds animation.
+  const isFlyingRef = useRef(false);
   useEffect(() => {
     pathRef.current = path;
   }, [path]);
@@ -682,6 +712,18 @@ export default function MapCanvas() {
 
     const enforceConstraints = () => {
       if (adjusting) return;
+      // Don't enforce constraints during a fly. flyToBounds emits
+      // many 'move' events during the animation; at intermediate
+      // frames the viewport can briefly overshoot the polar latitude
+      // limits, which would otherwise trigger map.panBy() to correct
+      // it. panBy fires 'moveend' even with animate:false — and that
+      // moveend fires onViewSettled mid-fly, prematurely clearing
+      // isFlyingRef and re-attaching borders during the still-running
+      // zoom animation (the ghost-border bug). The fly's start and
+      // end are both valid viewports, so skipping correction during
+      // the animation is safe; if the camera ever did land out of
+      // bounds, the next user pan/zoom would correct it.
+      if (isFlyingRef.current) return;
       const northPixelY = map.latLngToContainerPoint([NORTH_LIMIT, 0]).y;
       const southPixelY = map.latLngToContainerPoint([SOUTH_LIMIT, 0]).y;
       const viewportHeight = container.offsetHeight;
@@ -727,25 +769,111 @@ export default function MapCanvas() {
 
     // ─── View-settled handler: reconcile per-(code, offset) layers ───
     //
-    // Fires after pan/zoom completes. For each currently-attached code
-    // (border or target), recompute which offsets should be rendered for
-    // the new viewport and adjust attached layers accordingly. Codes that
-    // aren't currently attached are NOT touched here — those are the
-    // responsibility of the path/hover effects, which fetch geometry if
-    // needed and call reconcile when ready.
+    // Phase C (after a fly completes) and "non-fly view settle"
+    // (manual pan, programmatic setView, etc.) are handled here.
+    //
+    // For non-fly: reconcile attached layer offsets immediately.
+    //
+    // For fly completion: defer all DOM work via rAF×2 + setTimeout
+    // 150ms to give Leaflet's animation system time to fully settle
+    // before we touch the DOM. Then clear the flying flag, remove
+    // the scr-flying class (re-enabling cursor and pointer events),
+    // and re-attach all path[1..] borders that Phase A had detached.
     //
     // We listen on moveend AND zoomend because a zoom-with-pan-component
-    // can fire only one or the other depending on Leaflet internals; the
-    // reconcile is idempotent so the occasional duplicate is harmless.
+    // can fire only one or the other depending on Leaflet internals;
+    // both paths (rAF chains) eventually run, but their work is
+    // idempotent (reconcile* functions check what's already attached).
     const onViewSettled = () => {
       if (!mapRef.current) return;
-      const [viewLeft, viewRight] = getViewportLngRange(mapRef.current);
-      for (const code of attachedTargetsByCodeRef.current.keys()) {
-        reconcileTargetsForCode(code, viewLeft, viewRight);
+
+      // Non-fly view settle: handle immediately.
+      if (!isFlyingRef.current) {
+        const [vL, vR] = getViewportLngRange(mapRef.current);
+        for (const code of attachedTargetsByCodeRef.current.keys()) {
+          reconcileTargetsForCode(code, vL, vR);
+        }
+        for (const code of attachedBordersByCodeRef.current.keys()) {
+          reconcileBordersForCode(code, vL, vR);
+        }
+        return;
       }
-      for (const code of attachedBordersByCodeRef.current.keys()) {
-        reconcileBordersForCode(code, viewLeft, viewRight);
-      }
+
+      // Fly just completed. Defer DOM work to ensure Leaflet's
+      // animation system is fully done. rAF×2 puts us past the next
+      // paint cycle; setTimeout adds a margin past any lingering
+      // internal cleanup. ~150ms before the reconciliation finishes.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            if (!mapRef.current) return;
+
+            // Clear fly state. Cursor and pointer events restored.
+            isFlyingRef.current = false;
+            setFlyingInactive(containerRef.current);
+
+            // Reconcile target offsets at the new viewport. Targets
+            // are kept attached during the fly (they're invisible);
+            // their offsets may need updating after the camera move.
+            const [vL, vR] = getViewportLngRange(mapRef.current);
+            for (const code of attachedTargetsByCodeRef.current.keys()) {
+              reconcileTargetsForCode(code, vL, vR);
+            }
+
+            // Full border reconciliation against the new desired set.
+            // Phase A no longer detached borders, so attached can
+            // include any combination of: previous-path codes,
+            // previous hover, plus any borders attached before that.
+            // Compute the desired set (path[1..] + current hover) and
+            // bring attached into agreement: detach what's not wanted,
+            // attach what is.
+            const currentPath = pathRef.current;
+            const currentHover = hoveredCodeRef.current;
+            const desired = new Set<string>();
+            for (let i = 1; i < currentPath.length; i++) {
+              desired.add(currentPath[i]);
+            }
+            if (
+              currentHover &&
+              currentHover !== '000' &&
+              !currentPath.includes(currentHover)
+            ) {
+              desired.add(currentHover);
+            }
+
+            // Detach codes not in desired.
+            for (const code of [...attachedBordersByCodeRef.current.keys()]) {
+              if (!desired.has(code)) {
+                detachAllBordersForCode(code);
+              }
+            }
+
+            // Attach codes in desired. reconcileBordersForCode is
+            // idempotent for already-attached codes; for codes whose
+            // full geometry isn't cached yet (typically ADM1+), fetch
+            // first.
+            for (const code of desired) {
+              if (contiguousGeomByCodeRef.current.has(code)) {
+                reconcileBordersForCode(code, vL, vR);
+              } else {
+                fetchGeometry(code)
+                  .then(() => {
+                    if (!mapRef.current) return;
+                    // Re-check: user may have navigated away.
+                    const latestPath = pathRef.current;
+                    const latestHover = hoveredCodeRef.current;
+                    const stillDesired =
+                      latestPath.includes(code) || latestHover === code;
+                    if (!stillDesired) return;
+                    const [vL2, vR2] = getViewportLngRange(mapRef.current);
+                    reconcileBordersForCode(code, vL2, vR2);
+                  })
+                  .catch(() => {});
+              }
+            }
+          }, 150);
+        });
+      });
     };
     map.on('moveend', onViewSettled);
     map.on('zoomend', onViewSettled);
@@ -827,6 +955,35 @@ export default function MapCanvas() {
       }
       .scr-target:focus, .scr-border:focus {
         outline: none;
+      }
+      /* While a fly-to animation is in progress, hide the cursor
+         entirely and disable pointer events on country layers.
+
+         The .scr-flying class is added to BOTH document.body and the
+         map container at fly start. The selectors below match either
+         placement, so the rules apply regardless of where in the DOM
+         the class lands. Body-level placement is the load-bearing one
+         — it lets the universal selector reach every element in the
+         page, including SVG paths nested deep inside Leaflet's own
+         markup, without specificity wars.
+
+         CSS cursor on a parent does NOT override an explicit cursor
+         on a child element under the pointer. .scr-target sets cursor:
+         pointer directly on each country path. The universal-selector
+         rule (".scr-flying *" and "body.scr-flying *") applies cursor:
+         none directly to every descendant, with !important to beat
+         the .scr-target rule's own pointer cursor. */
+      body.scr-flying,
+      body.scr-flying *,
+      .scr-flying,
+      .scr-flying * {
+        cursor: none !important;
+      }
+      body.scr-flying .scr-target,
+      body.scr-flying .leaflet-interactive,
+      .scr-flying .scr-target,
+      .scr-flying .leaflet-interactive {
+        pointer-events: none !important;
       }
     `;
     document.head.appendChild(styleEl);
@@ -1100,9 +1257,19 @@ export default function MapCanvas() {
     if (supportsHover) {
       layer.on({
         mouseover: () => {
+          // Suppress hover state changes during a fly. Leaflet
+          // re-projects SVG paths each frame of a zoom animation;
+          // those re-projections can synthesize mouseover/mouseout
+          // events as paths move under a stationary cursor, which
+          // would otherwise trigger setHoveredCode → re-render →
+          // border useEffect, potentially attaching a border for
+          // whichever country the cursor briefly intersects mid-fly.
+          // The flag is cleared in onViewSettled when the fly ends.
+          if (isFlyingRef.current) return;
           setHoveredCode(code);
         },
         mouseout: () => {
+          if (isFlyingRef.current) return;
           setHoveredCode((current) => (current === code ? null : current));
         },
       });
@@ -1387,25 +1554,59 @@ export default function MapCanvas() {
   //   2. Zoom to fit the new deepest selection. For World, max-expand
   //      back to the initial centered, fully-zoomed-out view.
   //
-  // For non-World destinations: full-resolution geometry must be in
-  // memory AND attached to the map AND painted to the screen before
-  // the fly animation starts. Otherwise iOS Safari briefly renders
-  // the border at the wrong y-position when an SVG path with tens of
-  // thousands of vertices (USA, Canada, Russia at HPSCU resolution)
-  // is added to the map mid-animation. The fix sequences the work:
-  // fetchGeometry → reconcileBordersForCode → two animation frames
-  // (one for layout, one for paint) → flyToBounds. ~32 ms of added
-  // latency at 60fps; imperceptible relative to the 1.2 s zoom.
+  // Border attachment for the new deepest code is deferred until the
+  // fly animation completes — see isFlyingRef and the moveend handler
+  // in onViewSettled. The border useEffect is informed via isFlyingRef
+  // and skips the deepest code's attach while a fly is in progress.
+  // This sidesteps an iOS Safari rendering glitch where a complex SVG
+  // path added to the map during a CSS-driven zoom animation briefly
+  // renders at the wrong y-position before snapping into place.
   //
   // The flyToBounds animation will fire moveend at completion, which
   // the onViewSettled handler installed in the map-init effect picks
-  // up to re-reconcile every attached code's offsets against the new
+  // up to clear isFlyingRef, attach the deferred border, and
+  // re-reconcile every attached code's offsets against the new
   // viewport.
   useEffect(() => {
     ensureTargetsForPath(path);
 
     const map = mapRef.current;
     if (!map) return;
+
+    // ─── Phase A: synchronous preparation for the fly ───
+    //
+    // Set isFlyingRef so the border useEffect bails when it runs
+    // after this effect. Add the scr-flying class to disable cursor
+    // interaction with country layers (pointer-events:none) and hide
+    // the cursor (cursor:none) for the duration of the zoom.
+    //
+    // We deliberately do NOT detach the currently-attached borders
+    // and do NOT clear hover state. Whatever is on screen at click
+    // time — the previous selection's green border, plus any hover
+    // border — stays attached and gets animated along with the rest
+    // of the SVG layer by the zoom transform. The earlier "ghost
+    // border" bug came from enforceConstraints firing moveend
+    // mid-fly, which was fixed by gating that on isFlyingRef. With
+    // that root cause addressed, leaving borders attached during the
+    // animation is safe and gives a nicer visual experience: the
+    // selection appears continuous through the zoom rather than
+    // disappearing and reappearing.
+    //
+    // After the fly settles, Phase C reconciles everything to the
+    // new desired set (path[1..] + current hover) — detaching codes
+    // that aren't wanted, attaching new codes that are.
+
+    // 1. Mark fly-in-progress synchronously. Border useEffect (which
+    //    runs after this effect on the same render) reads this and
+    //    bails. Hover handlers also read this and no-op.
+    isFlyingRef.current = true;
+
+    // 2. Disable cursor interaction with country layers and hide
+    //    the cursor entirely. Adds scr-flying to BOTH document.body
+    //    and the map container; CSS rules match either location.
+    //    Removed in onViewSettled after the fly settles.
+    const container = containerRef.current;
+    setFlyingActive(container);
 
     const deepest = path[path.length - 1];
     if (deepest === '000') {
@@ -1428,55 +1629,46 @@ export default function MapCanvas() {
       return;
     }
 
-    // Attach the border at full resolution, wait for paint, then fly.
-    // Re-checks the path at each async boundary so an in-flight
-    // sequence aborts cleanly if the user navigates away mid-fetch
-    // or mid-frame-wait.
-    const attachBorderAndFly = () => {
-      if (pathRef.current[pathRef.current.length - 1] !== deepest) return;
-      const m = mapRef.current;
-      if (!m) return;
-      const [vL, vR] = getViewportLngRange(m);
-      // Synchronously attach the full-resolution border. By this point
-      // contiguousGeomByCodeRef has the geometry (we awaited it above
-      // when not already cached), so reconcileBordersForCode builds
-      // and adds the layer immediately rather than going through its
-      // own deferred fetch path in the border useEffect.
-      reconcileBordersForCode(deepest, vL, vR);
-      // Two rAFs: first to commit the layer addition into a layout,
-      // second to ensure the browser has painted it. After both fire
-      // we know the border is on screen, and the fly animation can
-      // start without iOS Safari having to insert a complex SVG path
-      // mid-CSS-transform.
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (pathRef.current[pathRef.current.length - 1] !== deepest) return;
-          const m2 = mapRef.current;
-          if (!m2) return;
-          const bounds = boundsByCodeRef.current.get(deepest);
-          if (!bounds || !bounds.isValid()) return;
-          const currentLng = m2.getCenter().lng;
-          const shiftedBounds = shiftBoundsToNearest(bounds, currentLng);
-          // flyToBounds (not fitBounds) is required to honor `duration`.
-          // fitBounds delegates the zoom portion to a fixed-duration CSS
-          // transition, ignoring our `duration`. flyToBounds does an
-          // integrated zoom+pan with a real, configurable duration.
-          m2.flyToBounds(shiftedBounds, {
-            padding: [60, 60],
-            duration: 1.2,
-          });
-        });
+    // Geometry might still be loading; if so, schedule when ready.
+    const tryZoom = () => {
+      const bounds = boundsByCodeRef.current.get(deepest);
+      if (!bounds || !bounds.isValid()) return false;
+      // Shift the bounds to the copy of the world nearest the current
+      // map center, so flyToBounds takes the short path. Without this,
+      // a contiguous-form crosser (e.g. USA's [144.6, 295.4]) seen from
+      // a current center near Canada at lng ~ -95 would animate +315
+      // east instead of -45 west. Same destination, much shorter trip.
+      const currentLng = map.getCenter().lng;
+      const shiftedBounds = shiftBoundsToNearest(bounds, currentLng);
+      // flyToBounds (not fitBounds) is required to honor `duration`.
+      // fitBounds delegates the zoom portion to a fixed-duration CSS
+      // transition, ignoring our `duration`. flyToBounds does an
+      // integrated zoom+pan with a real, configurable duration.
+      map.flyToBounds(shiftedBounds, {
+        padding: [60, 60],
+        duration: 1.2,
       });
+      return true;
     };
 
-    if (contiguousGeomByCodeRef.current.has(deepest)) {
-      attachBorderAndFly();
-    } else {
+    if (!tryZoom()) {
       fetchGeometry(deepest)
         .then(() => {
-          attachBorderAndFly();
+          // Re-check path; user may have already navigated away.
+          if (pathRef.current[pathRef.current.length - 1] !== deepest) {
+            isFlyingRef.current = false;
+            setFlyingInactive(containerRef.current);
+            return;
+          }
+          if (!tryZoom()) {
+            isFlyingRef.current = false;
+            setFlyingInactive(containerRef.current);
+          }
         })
-        .catch(() => {});
+        .catch(() => {
+          isFlyingRef.current = false;
+          setFlyingInactive(containerRef.current);
+        });
     }
   }, [path]);
 
@@ -1492,6 +1684,17 @@ export default function MapCanvas() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
+
+    // While a fly is in progress, do nothing. The path useEffect ran
+    // first on this same render and pre-emptively detached every
+    // border that wouldn't be in the post-fly ancestor set, so the
+    // currently-attached layers are exactly what should remain on
+    // screen during the zoom. Path or hover changes mid-fly are
+    // ignored — any new desired borders are picked up after moveend
+    // by onViewSettled (for the deepest path code) or by the next
+    // organic run of this effect (for hover changes after the fly
+    // completes).
+    if (isFlyingRef.current) return;
 
     const desired = new Set<string>();
     for (let i = 1; i < path.length; i++) desired.add(path[i]);
