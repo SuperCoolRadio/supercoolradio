@@ -1812,15 +1812,71 @@ export default function MapCanvas() {
     attachedTargetsByCodeRef.current.delete(code);
   };
 
+  // Detach every attached border for `code`, AND evict the full-
+  // precision data backing those borders so iOS Safari can actually
+  // reclaim the memory.
+  //
+  // What gets evicted (full-precision tier — the heavy stuff):
+  //   - Map layers in cachedBordersByKeyRef whose key prefix matches
+  //     this code. These hold parsed SVG paths with up to ~200K
+  //     vertices for the worst polygons (Russia, Canada, USA), each of
+  //     which dwarfs the simplified-tier equivalent by a factor of
+  //     50-200. Cleared via clearLayers() + off() before the cache
+  //     reference is dropped, so Leaflet's internal references release
+  //     promptly rather than waiting on GC to traverse the layer's
+  //     event listeners.
+  //   - The parsed GeoJSON tree in contiguousGeomByCodeRef, which is
+  //     what those layers were built from. Re-clicking the code will
+  //     re-fetch from boundaries.supercoolradio.com — that's a strict
+  //     network cost but the two-stage border architecture means the
+  //     user sees a (simplified) border immediately on re-click, no
+  //     perceived latency.
+  //
+  // What stays cached forever (simplified tier — small):
+  //   - cachedSimpleBordersByKeyRef (the immediate-draw stand-ins)
+  //   - cachedTargetsByKeyRef (invisible hit-target layers)
+  //   - contiguousSimpleGeomByCodeRef (the raw simplified geometry)
+  //   - boundsByCodeRef
+  //
+  //   These are what the polygon needs to remain interactive after
+  //   eviction. They're cheap (T3/T6 vertex counts are 50-200x smaller
+  //   than full precision) and dropping them would break clicks/hovers
+  //   while saving a trivial amount of memory.
+  //
+  // The motivation: on iOS Safari, accumulating full-precision data
+  // across navigation steps eventually trips Safari's silent-reload
+  // memory threshold (verified 2026-05-03: Canada → Nunavut → another
+  // Canadian province reset the page to world view). Evicting
+  // full-precision data when a code leaves the desired set keeps the
+  // heap bounded by "currently displayed borders," not "every border
+  // ever displayed."
   const detachAllBordersForCode = (code: string) => {
     const map = mapRef.current;
     if (!map) return;
     const attached = attachedBordersByCodeRef.current.get(code);
-    if (!attached) return;
-    for (const layer of attached.values()) {
-      map.removeLayer(layer);
+    if (attached) {
+      for (const layer of attached.values()) {
+        map.removeLayer(layer);
+      }
+      attachedBordersByCodeRef.current.delete(code);
     }
-    attachedBordersByCodeRef.current.delete(code);
+
+    // Evict any cached full-precision border layers for this code. The
+    // cache key is `${code}@${offset}` (see layerKey) — match by
+    // prefix. clearLayers() drops Leaflet's internal feature data;
+    // off() removes any event listeners (none on borders today, but
+    // defensive). After both, dropping the cache reference allows GC
+    // to actually reclaim the path data.
+    const fullKeyPrefix = `${code}@`;
+    for (const [key, layer] of [...cachedBordersByKeyRef.current]) {
+      if (!key.startsWith(fullKeyPrefix)) continue;
+      layer.clearLayers();
+      layer.off();
+      cachedBordersByKeyRef.current.delete(key);
+    }
+
+    // Evict the parsed full-precision GeoJSON. Refetched on re-click.
+    contiguousGeomByCodeRef.current.delete(code);
   };
 
   // Given a path, ensure the right set of target polygons is on the map.
