@@ -714,6 +714,115 @@ const supportsHover =
   typeof window !== 'undefined' &&
   window.matchMedia('(hover: hover)').matches;
 
+// ─── Debug instrumentation ──────────────────────────────────────────────
+//
+// Activated by appending `?debug=1` to the URL. When active, every dbg()
+// call writes to console.log AND appends to a ring buffer that's
+// rendered as a fixed-position overlay on the page (see DebugOverlay
+// component in the return JSX). This lets us read instrumented state
+// directly on a phone screen, where Safari's console isn't easily
+// accessible without USB debugging.
+//
+// The overlay is invisible when DEBUG is false — zero overhead in
+// production. The dbg() function itself is also a no-op when DEBUG is
+// false, so there's no string-formatting cost on the production path.
+//
+// Diagnostic events captured:
+//   - Bundle loads (mount-time ADM0, per-parent ADM1)
+//   - Per-polygon fetch start/success/failure
+//   - contiguousGeomByCodeRef set/delete (full-precision in-heap)
+//   - cachedBordersByKeyRef set/delete (parsed Leaflet border layers)
+//   - Periodic state snapshots (counts of in-heap entries, totals)
+//   - pagehide event (fires when iOS Safari is about to suspend or
+//     terminate the page; useful for catching the moment of soft-
+//     reload)
+//   - Uncaught errors and unhandled promise rejections
+const DEBUG =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('debug') === '1';
+
+const DEBUG_BUFFER_MAX = 80;
+const debugLog: string[] = [];
+const debugListeners = new Set<() => void>();
+
+const dbg = (line: string): void => {
+  if (!DEBUG) return;
+  const stamp = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  const formatted = `${stamp} ${line}`;
+  console.log(`[dbg] ${formatted}`);
+  debugLog.push(formatted);
+  if (debugLog.length > DEBUG_BUFFER_MAX) {
+    debugLog.splice(0, debugLog.length - DEBUG_BUFFER_MAX);
+  }
+  for (const fn of debugListeners) fn();
+};
+
+if (DEBUG && typeof window !== 'undefined') {
+  // Capture iOS Safari's "tab is going away" signals. pagehide is the
+  // closest thing to a kill-warning Safari gives us.
+  window.addEventListener('pagehide', (e) => {
+    dbg(`PAGEHIDE persisted=${e.persisted}`);
+  });
+  window.addEventListener('error', (e) => {
+    dbg(`ERROR: ${e.message} @ ${e.filename}:${e.lineno}`);
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e.reason;
+    const msg =
+      reason && typeof reason === 'object' && 'message' in reason
+        ? (reason as { message: string }).message
+        : String(reason);
+    dbg(`UNHANDLED REJECTION: ${msg}`);
+  });
+}
+
+// Debug overlay: subscribes to debugListeners to re-render on each new
+// dbg() line. Renders a fixed-position translucent panel showing the
+// most recent debug-buffer entries. Only mounted when DEBUG is true.
+//
+// Top-right corner so it doesn't overlap the breadcrumb (top-left).
+// Capped height with internal scrolling, but rendered "newest at
+// bottom" with a flex column-reverse so the latest line is always
+// visible without scrolling.
+const DebugOverlay = () => {
+  const [, forceUpdate] = useState(0);
+  useEffect(() => {
+    const fn = () => forceUpdate((n) => n + 1);
+    debugListeners.add(fn);
+    return () => {
+      debugListeners.delete(fn);
+    };
+  }, []);
+
+  if (!DEBUG) return null;
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        top: 8,
+        right: 8,
+        zIndex: 2000,
+        width: 'min(420px, 50vw)',
+        maxHeight: '60vh',
+        overflowY: 'auto',
+        background: 'rgba(0, 0, 0, 0.78)',
+        color: '#9fe89f',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 10,
+        lineHeight: 1.35,
+        padding: '6px 8px',
+        borderRadius: 4,
+        pointerEvents: 'none',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-all',
+      }}
+    >
+      {debugLog.slice(-DEBUG_BUFFER_MAX).join('\n')}
+    </div>
+  );
+};
+
 export default function MapCanvas() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -1230,6 +1339,15 @@ export default function MapCanvas() {
         console.log(
           `[SCR] adm0-t${ADM0_TIER}.json loaded — ${hydratedCount} ADM0 entries hydrated`,
         );
+        if (DEBUG) {
+          let simpleVerts = 0;
+          for (const g of contiguousSimpleGeomByCodeRef.current.values()) {
+            simpleVerts += countCoords(g);
+          }
+          dbg(
+            `BUNDLE adm0-t${ADM0_TIER} +${hydratedCount} | simple-cache: ${contiguousSimpleGeomByCodeRef.current.size} codes ${simpleVerts.toLocaleString()}v`,
+          );
+        }
 
         // Trigger first render: build World's children (Areas) as
         // targets. With the bundle in place, this completes
@@ -1269,6 +1387,7 @@ export default function MapCanvas() {
       dirParts.push(parts.slice(0, i + 1).join('-'));
     }
     const url = `${BOUNDARIES_BASE}/${dirParts.join('/')}/${code}.geojson`;
+    if (DEBUG) dbg(`FETCH→ ${code}`);
 
     const promise = fetch(url)
       .then((res) => {
@@ -1309,6 +1428,17 @@ export default function MapCanvas() {
         // current viewport.
         const contiguousGeom = shiftGeometryLngs(origGeom, polyMin);
         contiguousGeomByCodeRef.current.set(code, contiguousGeom);
+        if (DEBUG) {
+          const verts = countCoords(contiguousGeom);
+          const totalCodes = contiguousGeomByCodeRef.current.size;
+          let totalVerts = 0;
+          for (const g of contiguousGeomByCodeRef.current.values()) {
+            totalVerts += countCoords(g);
+          }
+          dbg(
+            `FULL+ ${code} ${verts.toLocaleString()}v | full-cache: ${totalCodes} codes ${totalVerts.toLocaleString()}v`,
+          );
+        }
 
         // Simplify the contiguous form for the invisible hit-target
         // layer — but skip if already populated. Codes hydrated from a
@@ -1443,6 +1573,15 @@ export default function MapCanvas() {
         console.log(
           `[SCR] adm1/${parentCode}-t${ADM1_TIER}.json loaded — ${hydratedCount} entries hydrated`,
         );
+        if (DEBUG) {
+          let simpleVerts = 0;
+          for (const g of contiguousSimpleGeomByCodeRef.current.values()) {
+            simpleVerts += countCoords(g);
+          }
+          dbg(
+            `BUNDLE adm1/${parentCode}-t${ADM1_TIER} +${hydratedCount} | simple-cache: ${contiguousSimpleGeomByCodeRef.current.size} codes ${simpleVerts.toLocaleString()}v`,
+          );
+        }
       })
       .catch((err) => {
         console.error(
@@ -1526,6 +1665,7 @@ export default function MapCanvas() {
     layer.on({
       click: (e: L.LeafletMouseEvent) => {
         L.DomEvent.stopPropagation(e);
+        if (DEBUG) dbg(`CLICK ${code}`);
         const idx = treeIndexRef.current;
         if (!idx) return;
         const ancestry = idx.codeToAncestry.get(code);
@@ -1868,15 +2008,28 @@ export default function MapCanvas() {
     // defensive). After both, dropping the cache reference allows GC
     // to actually reclaim the path data.
     const fullKeyPrefix = `${code}@`;
+    let evictedLayers = 0;
     for (const [key, layer] of [...cachedBordersByKeyRef.current]) {
       if (!key.startsWith(fullKeyPrefix)) continue;
       layer.clearLayers();
       layer.off();
       cachedBordersByKeyRef.current.delete(key);
+      evictedLayers++;
     }
 
     // Evict the parsed full-precision GeoJSON. Refetched on re-click.
+    const hadGeom = contiguousGeomByCodeRef.current.has(code);
     contiguousGeomByCodeRef.current.delete(code);
+    if (DEBUG) {
+      const totalCodes = contiguousGeomByCodeRef.current.size;
+      let totalVerts = 0;
+      for (const g of contiguousGeomByCodeRef.current.values()) {
+        totalVerts += countCoords(g);
+      }
+      dbg(
+        `EVICT ${code} layers=${evictedLayers} geom=${hadGeom ? 'yes' : 'no'} | full-cache: ${totalCodes} codes ${totalVerts.toLocaleString()}v`,
+      );
+    }
   };
 
   // Given a path, ensure the right set of target polygons is on the map.
@@ -2011,6 +2164,7 @@ export default function MapCanvas() {
   // re-reconcile every attached code's offsets against the new
   // viewport.
   useEffect(() => {
+    if (DEBUG) dbg(`PATH ${path.join('→')}`);
     ensureTargetsForPath(path);
 
     const map = mapRef.current;
@@ -2347,6 +2501,7 @@ export default function MapCanvas() {
           );
         })}
       </nav>
+      <DebugOverlay />
     </>
   );
 }
