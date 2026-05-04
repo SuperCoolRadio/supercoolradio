@@ -15,12 +15,14 @@ type TreeNode = {
   children?: TreeNode[];
 };
 
-// Shape of /data/simplified-adm0.json. Keys are ADM0 codes (3-digit ISO
-// 3166-1 numeric, zero-padded). Each entry stores the country's wrapped
-// bounds (minLat/maxLat/minLng/maxLng — see computeWrappedBounds for the
-// largest-gap algorithm that handles antimeridian crossers) and its
-// Douglas-Peucker–simplified contiguous-form geometry. Produced by
-// scripts/build-simplified-adm0.mjs.
+// Shape of every tiered hit-target bundle (adm0-tN.json, adm1/<NNN>-tN.json,
+// and adm2/<NNN>-<MMM>-tN.json when Sub-Regions return). Keys are codes —
+// for the ADM0 bundle, 3-digit ISO 3166-1 numeric zero-padded; for ADM1
+// bundles, '<parent>-<sequential>' (e.g. '840-005' for California in USA's
+// bundle). Each entry stores the polygon's wrapped bounds (minLat/maxLat/
+// minLng/maxLng — see computeWrappedBounds for the largest-gap algorithm
+// that handles antimeridian crossers) and its Douglas-Peucker–simplified
+// contiguous-form geometry. Produced by scripts/build-simplified-tiers.mjs.
 type SimplifiedBundle = {
   [code: string]: {
     bounds: { minLat: number; maxLat: number; minLng: number; maxLng: number };
@@ -30,18 +32,49 @@ type SimplifiedBundle = {
 
 const BOUNDARIES_BASE = 'https://boundaries.supercoolradio.com/tree';
 
-// Mount-time bundle: simplified geometry + bounds for every ADM0 country,
-// pre-computed at build time by scripts/build-simplified-adm0.mjs and
-// shipped as a single static asset (~2.5 MB uncompressed). Loaded once at
-// mount in parallel with tree.json. Without this, the runtime had to
-// fetch all 230 country GeoJSONs at mount, parse and Douglas-Peucker
-// simplify each on the main thread before any borders could render —
-// enough memory pressure to OOM mobile Safari under sustained zoom
-// thrashing (verified 2026-04-30: 20 sec rapid zoom on iPhone → tab
-// kill). The bundle gives us hit-targets at World view "for free"; full-
-// resolution geometry is fetched per-country only when a green border
-// needs to be drawn.
-const SIMPLIFIED_ADM0_URL = '/data/simplified-adm0.json';
+// Base URL for tiered simplified-geometry bundles. These bundles
+// provide pre-simplified hit-target geometry per administrative level:
+// one bundle for all ADM0 (loaded at mount), one bundle per subdivided
+// ADM0 for that country's ADM1 children (loaded on drill-in). Built
+// offline by scripts/build-simplified-tiers.mjs. Served from a
+// dedicated R2 bucket via CORS-enabled custom domain.
+const SIMPLIFIED_BOUNDARIES_BASE =
+  'https://simplified-boundaries.supercoolradio.com';
+
+// Tier selections for hit-targets. The build script's tier ladder
+// halves Douglas-Peucker tolerance per step, so tier number ≈ Leaflet
+// zoom level where the tier's tolerance equals one equatorial pixel;
+// finer tiers are sub-pixel margins, coarser tiers are visibly
+// stair-stepped.
+//
+// ADM0 hit-targets at T3 (~20 km tolerance, ~2 MB for all 232
+// countries). World view operates at zoom 0–3 where a screen pixel is
+// 10–80 km, so T3 is solidly sub-pixel for hit-test purposes — the
+// user can never feel the difference between T3 and full resolution
+// when clicking a country at world view.
+//
+// ADM1 hit-targets at T6 (~2.4 km tolerance). Per-parent bundle (one
+// per subdivided country), fetched on drill-in. ~100 KB to ~1 MB each;
+// total across all 50 subdivided countries is a few MB. Drilled-into-
+// country view operates at zoom 3–6 where a pixel is 1.2–10 km, so T6
+// is sub-pixel for hit-test purposes there.
+//
+// Borders (the visible green lines) are NOT drawn from these bundles
+// — they fetch full-precision per-polygon from BOUNDARIES_BASE on
+// demand, preserving the platform's "displayed borders are full
+// precision" invariant.
+//
+// Microstate hit-targets: the build script enforces an 8-vertex floor
+// per polygon (walking down the fallback tolerance ladder, ultimately
+// shipping the original geometry if even tolerance 0 collapses below
+// 8). At T3 / T6 the inscribed octagon for a tiny island still covers
+// the bulk of its surface area — clickable across most of the island
+// once the user is zoomed in enough to see it.
+const ADM0_TIER = 3;
+const ADM1_TIER = 6;
+const ADM0_BUNDLE_URL = `${SIMPLIFIED_BOUNDARIES_BASE}/adm0-t${ADM0_TIER}.json`;
+const adm1BundleUrl = (parentCode: string) =>
+  `${SIMPLIFIED_BOUNDARIES_BASE}/adm1/${parentCode}-t${ADM1_TIER}.json`;
 
 // Border color by administrative level. ADM0 (Areas) green, ADM1
 // (Regions) yellow, ADM2 (Sub-Regions) cyan. Bright pure-channel colors
@@ -719,6 +752,19 @@ export default function MapCanvas() {
   // In-flight fetch promises by code, to dedupe concurrent loads.
   const inflightByCodeRef = useRef<Map<string, Promise<void>>>(new Map());
 
+  // In-flight per-parent ADM1 bundle fetches, keyed by parent code (the
+  // ADM0 code, e.g. '840' for USA). One bundle per subdivided country
+  // hydrates all of that country's ADM1 children in a single fetch,
+  // eliminating the per-child fetch storm that would otherwise fire on
+  // drill-in (51 fetches for USA, 33 for China, etc.) — that storm was
+  // the iPhone-killer for heavy countries. Deduplicates concurrent
+  // requests for the same parent; entries are cleared on settle. The
+  // ADM0 bundle is loaded once at mount in the data-load useEffect, so
+  // parent code '000' (the World) never appears here.
+  const inflightBundleByParentRef = useRef<Map<string, Promise<void>>>(
+    new Map(),
+  );
+
   // ─── Render-time Leaflet layers, keyed by (code, offset) ───
   //
   // cachedTargetsByKeyRef / cachedBordersByKeyRef:
@@ -1100,20 +1146,28 @@ export default function MapCanvas() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  // Mount-time data load: fetch tree.json AND simplified-adm0.json in
-  // parallel. The tree gives us the navigation structure (codes, parent/
-  // child relationships); the bundle gives us bounds + simplified
-  // geometry for all ADM0 countries (hit-targets without a per-country
-  // network round trip). Both must arrive before we can render the
-  // initial World view. After both land, we trigger ensureTargetsForPath
-  // for World, which now finds simple geom already in cache for every
-  // ADM0 child and builds hit-targets synchronously with no fetching.
+  // Mount-time data load: fetch tree.json AND the ADM0 hit-target
+  // bundle (adm0-tN.json) in parallel. The tree gives us the navigation
+  // structure (codes, parent/child relationships); the bundle gives us
+  // bounds + simplified geometry for all ADM0 countries (hit-targets
+  // without a per-country network round trip). Both must arrive before
+  // we can render the initial World view. After both land, we trigger
+  // ensureTargetsForPath for World, which now finds simple geom already
+  // in cache for every ADM0 child and builds hit-targets synchronously
+  // with no fetching.
   //
-  // Architectural note: full-resolution ADM0 geometry is NOT loaded here.
-  // It's fetched per-country, on demand, when the user navigates into a
-  // country and we need to draw the green border. See fetchGeometry
-  // below — it's been made idempotent on the bundle-populated refs so a
-  // subsequent fetch only does the work that wasn't already done.
+  // Architectural note: full-resolution ADM0 geometry is NOT loaded
+  // here. It's fetched per-country, on demand, when the user navigates
+  // into a country and we need to draw the green border. See
+  // fetchGeometry below — it's been made idempotent on the bundle-
+  // populated refs so a subsequent fetch only does the work that wasn't
+  // already done.
+  //
+  // ADM1 hit-targets follow the same pattern at one level deeper: when
+  // the user drills into a subdivided country, we fetch a per-parent
+  // ADM1 bundle (one HTTP round trip, all of that country's regions
+  // hydrated at once) — see ensureChildrenBundle. Borders for any ADM1
+  // region are still per-polygon full-precision.
   useEffect(() => {
     let stillMounted = true;
 
@@ -1123,9 +1177,11 @@ export default function MapCanvas() {
         return res.json();
       });
 
-    const bundleP = fetch(SIMPLIFIED_ADM0_URL)
+    const bundleP = fetch(ADM0_BUNDLE_URL)
       .then((res) => {
-        if (!res.ok) throw new Error(`simplified-adm0.json HTTP ${res.status}`);
+        if (!res.ok) {
+          throw new Error(`adm0-t${ADM0_TIER}.json HTTP ${res.status}`);
+        }
         return res.json();
       });
 
@@ -1156,7 +1212,9 @@ export default function MapCanvas() {
           contiguousSimpleGeomByCodeRef.current.set(code, entry.geom);
           hydratedCount++;
         }
-        console.log(`[SCR] simplified-adm0.json loaded — ${hydratedCount} ADM0 entries hydrated`);
+        console.log(
+          `[SCR] adm0-t${ADM0_TIER}.json loaded — ${hydratedCount} ADM0 entries hydrated`,
+        );
 
         // Trigger first render: build World's children (Areas) as
         // targets. With the bundle in place, this completes
@@ -1206,14 +1264,14 @@ export default function MapCanvas() {
         const origGeom = extractGeometry(geojson);
         if (!origGeom) throw new Error('no geometry');
 
-        // Compute and cache bounds — but skip if already populated. For
-        // ADM0 codes hydrated from simplified-adm0.json at mount, bounds
-        // are already in the ref. Re-computing would produce the same
-        // value (same source data) at the cost of sorting all coords
-        // (Russia: ~100k coords sorted = 30-50ms wasted main-thread
-        // time per country). Skip is safe because the bundle's bounds
-        // come from the same computeWrappedBounds algorithm running on
-        // the same source GeoJSON.
+        // Compute and cache bounds — but skip if already populated.
+        // Codes hydrated from a tiered bundle (ADM0 at mount, ADM1 on
+        // drill-in) already have bounds in the ref. Re-computing would
+        // produce the same value (same source data) at the cost of
+        // sorting all coords (Russia: ~100k coords sorted = 30-50ms
+        // wasted main-thread time per country). Skip is safe because
+        // the bundle's bounds come from the same computeWrappedBounds
+        // algorithm running on the same source GeoJSON.
         let bounds: L.LatLngBounds;
         if (boundsByCodeRef.current.has(code)) {
           bounds = boundsByCodeRef.current.get(code)!;
@@ -1238,14 +1296,15 @@ export default function MapCanvas() {
         contiguousGeomByCodeRef.current.set(code, contiguousGeom);
 
         // Simplify the contiguous form for the invisible hit-target
-        // layer — but skip if already populated. For ADM0 codes hydrated
-        // from the bundle, the simplified form is already cached (and
-        // was simplified at a coarser tolerance than the runtime would
-        // use; the bundle prioritizes file size and the runtime now
-        // never gets a chance to refine ADM0 hit-targets, which is fine
-        // because the bundle's tolerance is still well below pixel
-        // resolution at every reasonable zoom). For ADM1+ codes this
-        // simplifies as before.
+        // layer — but skip if already populated. Codes hydrated from a
+        // tiered bundle (ADM0 at T3 from mount, ADM1 at T6 from drill-
+        // in) already have a simplified form in cache, simplified at
+        // each tier's tolerance which was chosen to be sub-pixel for
+        // hit-test purposes at the relevant zoom range. The only path
+        // that reaches this branch is the rare defensive case where
+        // fetchGeometry is called for a code that no bundle covered
+        // (e.g. ADM2 codes if Sub-Regions return before their bundle
+        // pipeline ships).
         //
         // Note: we simplify AFTER the shift, not before. Simplifying the
         // unshifted geometry of a crosser would feed Douglas-Peucker a
@@ -1300,6 +1359,87 @@ export default function MapCanvas() {
         inflightByCodeRef.current.delete(code);
       });
     inflightByCodeRef.current.set(code, promise);
+    return promise;
+  };
+
+  // Ensure all of `parentCode`'s children have their bounds + simplified
+  // geometry hydrated. For an ADM0 parent ('840', '156', etc.), this
+  // means fetching the per-parent ADM1 bundle from R2, parsing it, and
+  // populating boundsByCodeRef + contiguousSimpleGeomByCodeRef for every
+  // entry. Idempotent and dedup'd: a second call while a fetch is in
+  // flight returns the same promise; a call after the bundle has
+  // already hydrated returns a resolved promise.
+  //
+  // The ADM0 bundle is loaded once at mount in the data-load useEffect,
+  // so this function returns immediately for parentCode === '000' (the
+  // World, whose children are the ADM0 codes).
+  //
+  // For unsubdivided countries (Algeria, Argentina, etc.) the desired
+  // set won't include any of their children — they have none — so this
+  // function is never called with their codes as parent. No bundle
+  // exists on R2 for them and no fetch is attempted.
+  //
+  // Failure modes: if the bundle fetch fails (network error, HTTP
+  // error, parse error), the error is logged and the promise rejects.
+  // The user-visible consequence is that the affected children won't
+  // have hit-targets — non-catastrophic, the user can ESC back out and
+  // the rest of the map keeps working. The next attempt will retry.
+  const ensureChildrenBundle = (parentCode: string): Promise<void> => {
+    // World's children (the 232 ADM0 codes) are loaded at mount.
+    if (parentCode === '000') return Promise.resolve();
+
+    // Already in flight or completed.
+    const inflight = inflightBundleByParentRef.current.get(parentCode);
+    if (inflight) return inflight;
+
+    // Fast-path: if every child of this parent is already hydrated, no
+    // fetch needed. Catches the case where this function is called
+    // again after a previous successful fetch (we don't aggressively
+    // evict cache entries on path pop).
+    const idx = treeIndexRef.current;
+    const node = idx?.codeToNode.get(parentCode);
+    const children = node?.children ?? [];
+    if (
+      children.length > 0 &&
+      children.every((c) =>
+        contiguousSimpleGeomByCodeRef.current.has(c.code),
+      )
+    ) {
+      return Promise.resolve();
+    }
+
+    const url = adm1BundleUrl(parentCode);
+    const promise = fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((bundle: SimplifiedBundle) => {
+        let hydratedCount = 0;
+        for (const [code, entry] of Object.entries(bundle)) {
+          const b = entry.bounds;
+          boundsByCodeRef.current.set(
+            code,
+            L.latLngBounds([b.minLat, b.minLng], [b.maxLat, b.maxLng]),
+          );
+          contiguousSimpleGeomByCodeRef.current.set(code, entry.geom);
+          hydratedCount++;
+        }
+        console.log(
+          `[SCR] adm1/${parentCode}-t${ADM1_TIER}.json loaded — ${hydratedCount} entries hydrated`,
+        );
+      })
+      .catch((err) => {
+        console.error(
+          `[SCR] adm1/${parentCode}-t${ADM1_TIER}.json fetch failed:`,
+          err.message ?? err,
+        );
+        throw err;
+      })
+      .finally(() => {
+        inflightBundleByParentRef.current.delete(parentCode);
+      });
+    inflightBundleByParentRef.current.set(parentCode, promise);
     return promise;
   };
 
@@ -1573,11 +1713,13 @@ export default function MapCanvas() {
   //   in Leaflet 1.x clicks on layers in custom panes can fall through
   //   to the underlying Area, masking the state click. (Hover works
   //   fine in custom panes; click does not.)
-  // - Path = ['000', '840', '840-005']: 231 Areas + 50 states + Calif's
-  //   Sub-Regions. California itself dropped, USA itself dropped.
+  // - Path = ['000', '840', '840-005']: 231 Areas + 50 states (USA and
+  //   California themselves dropped). California has no children in the
+  //   current tree, so nothing's added at the deepest level.
   //
-  // Adds missing targets (fetching geometry as needed); removes detached
-  // codes entirely. Per-code offset reconciliation is delegated to
+  // Adds missing targets, requesting per-parent bundles via
+  // ensureChildrenBundle as needed; removes detached codes entirely.
+  // Per-code offset reconciliation is delegated to
   // reconcileTargetsForCode.
   const ensureTargetsForPath = (currentPath: string[]) => {
     const map = mapRef.current;
@@ -1594,32 +1736,63 @@ export default function MapCanvas() {
       }
     }
 
-    // Reconcile each desired code. If simplified geometry is loaded
-    // (true for all ADM0 codes after the bundle hydrates at mount; true
-    // for ADM1+ codes only after they've been fetched), reconcile
-    // immediately. Otherwise fetch and reconcile when ready. Hit-targets
-    // are built from contiguousSimpleGeomByCodeRef, so that's the
-    // correct readiness predicate — not boundsByCodeRef, which would
-    // also pass for ADM0 codes that have bounds but no geometry yet
-    // (impossible after the bundle, but the predicate should match what
-    // the consumer actually reads from).
+    // Reconcile each desired code. Group by parent so we can fetch one
+    // bundle per parent rather than one fetch per child — eliminating
+    // the per-child fetch storm that previously fired on drill-in into
+    // a heavy country (51 fetches for USA, 33 for China, 13 for
+    // Canada). Each desired code has exactly one parent (its second-to-
+    // last ancestor), and that parent is somewhere in currentPath.
+    //
+    // Codes whose simplified geometry is already hydrated (true for all
+    // ADM0 codes after the mount-time bundle, true for ADM1 codes whose
+    // parent's bundle has been fetched on a prior drill-in) reconcile
+    // immediately. Codes whose parent's bundle has not yet loaded wait
+    // on a single ensureChildrenBundle call per parent — which dedupes
+    // concurrent calls and is a no-op for parent === '000'.
+    //
+    // Hit-targets are built from contiguousSimpleGeomByCodeRef, so
+    // that's the correct readiness predicate — not boundsByCodeRef,
+    // which would also pass for codes that have bounds but no geometry
+    // yet (impossible after the bundle, but the predicate should match
+    // what the consumer actually reads from).
+    const childrenByParent = new Map<string, string[]>();
     for (const code of desired) {
-      if (contiguousSimpleGeomByCodeRef.current.has(code)) {
-        reconcileTargetsForCode(code, viewLeft, viewRight);
-      } else {
-        fetchGeometry(code)
-          .then(() => {
-            // Re-check after async: path may have changed during fetch.
-            const latestDesired = computeDesiredFor(pathRef.current);
-            if (!latestDesired.has(code)) return;
-            if (!mapRef.current) return;
-            const [vL, vR] = getViewportLngRange(mapRef.current);
-            reconcileTargetsForCode(code, vL, vR);
-          })
-          .catch(() => {
-            // Already logged in fetchGeometry.
-          });
+      const ancestry = idx.codeToAncestry.get(code);
+      if (!ancestry || ancestry.length < 2) continue;
+      const parent = ancestry[ancestry.length - 2];
+      let bucket = childrenByParent.get(parent);
+      if (!bucket) {
+        bucket = [];
+        childrenByParent.set(parent, bucket);
       }
+      bucket.push(code);
+    }
+
+    for (const [parent, children] of childrenByParent) {
+      const allHydrated = children.every((c) =>
+        contiguousSimpleGeomByCodeRef.current.has(c),
+      );
+      if (allHydrated) {
+        for (const code of children) {
+          reconcileTargetsForCode(code, viewLeft, viewRight);
+        }
+        continue;
+      }
+      ensureChildrenBundle(parent)
+        .then(() => {
+          // Re-check after async: path may have changed during fetch.
+          const latestDesired = computeDesiredFor(pathRef.current);
+          if (!mapRef.current) return;
+          const [vL, vR] = getViewportLngRange(mapRef.current);
+          for (const code of children) {
+            if (!latestDesired.has(code)) continue;
+            if (!contiguousSimpleGeomByCodeRef.current.has(code)) continue;
+            reconcileTargetsForCode(code, vL, vR);
+          }
+        })
+        .catch(() => {
+          // Already logged in ensureChildrenBundle.
+        });
     }
   };
 
