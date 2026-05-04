@@ -30,48 +30,65 @@ type SimplifiedBundle = {
   };
 };
 
-const BOUNDARIES_BASE = 'https://boundaries.supercoolradio.com/tree';
+// Base URL for the per-polygon, per-tier simplified-geometry corpus.
+// Each polygon has its own GeoJSON file at every tier, mirroring the
+// directory structure of the source-of-truth full-precision corpus at
+// boundaries.supercoolradio.com — but with a tier suffix in the
+// filename. The runtime fetches BORDER_TIER files from here when
+// drawing borders.
+//
+// This corpus replaces the prior border source
+// (boundaries.supercoolradio.com/tree/...). The full-precision corpus
+// shipped polygons with absurd vertex counts (Nunavut: 5.4 million
+// vertices in a single MultiPolygon — the Arctic Archipelago at every-
+// rock detail), and Mobile Safari crashed when handed those as SVG
+// paths to rasterize. T6 (~2.4 km tolerance) is the chosen ceiling:
+// at our deepest tile zoom (8) one screen pixel is ~310 m at the
+// equator, so T6 is barely sub-pixel; finer than that buys nothing
+// visible and risks crashes.
+//
+// Built offline by scripts/build-simplified-tree.mjs.
+const BORDERS_BASE =
+  'https://simplified-boundaries.supercoolradio.com/tree';
 
-// Base URL for tiered simplified-geometry bundles. These bundles
-// provide pre-simplified hit-target geometry per administrative level:
-// one bundle for all ADM0 (loaded at mount), one bundle per subdivided
+// Tier used for drawn borders. Universal — applies to every level
+// (ADM0, ADM1, eventually ADM2). Picked as the smallest tier that's
+// effectively sub-pixel at our deepest tile zoom; any finer just
+// pays for invisible detail at the risk of vertex-count blowup.
+const BORDER_TIER = 6;
+
+// Base URL for tiered simplified-geometry hit-target bundles. These
+// bundles provide pre-simplified geometry for clicks/hovers: one
+// bundle for all ADM0 (loaded at mount), one bundle per subdivided
 // ADM0 for that country's ADM1 children (loaded on drill-in). Built
 // offline by scripts/build-simplified-tiers.mjs. Served from a
 // dedicated R2 bucket via CORS-enabled custom domain.
 const SIMPLIFIED_BOUNDARIES_BASE =
   'https://simplified-boundaries.supercoolradio.com';
 
-// Tier selections for hit-targets. The build script's tier ladder
-// halves Douglas-Peucker tolerance per step, so tier number ≈ Leaflet
-// zoom level where the tier's tolerance equals one equatorial pixel;
-// finer tiers are sub-pixel margins, coarser tiers are visibly
-// stair-stepped.
+// Tier selection for hit-targets. Universal across levels: T3
+// (~20 km tolerance) for both the world's ADM0 hit-targets (loaded at
+// mount) and each subdivided country's ADM1 hit-targets (loaded on
+// drill-in). T3 is comfortably sub-pixel at every zoom where you'd
+// click a polygon at the corresponding administrative level — World
+// view (zoom 0–3, pixel ≥ 10 km) for ADM0 clicks, drilled-into-
+// country view (zoom 3–5, pixel ≥ 5 km) for ADM1 clicks. Click
+// accuracy at borders is at most 1–2 pixels off, indistinguishable
+// in practice.
 //
-// ADM0 hit-targets at T3 (~20 km tolerance, ~2 MB for all 232
-// countries). World view operates at zoom 0–3 where a screen pixel is
-// 10–80 km, so T3 is solidly sub-pixel for hit-test purposes — the
-// user can never feel the difference between T3 and full resolution
-// when clicking a country at world view.
-//
-// ADM1 hit-targets at T6 (~2.4 km tolerance). Per-parent bundle (one
-// per subdivided country), fetched on drill-in. ~100 KB to ~1 MB each;
-// total across all 50 subdivided countries is a few MB. Drilled-into-
-// country view operates at zoom 3–6 where a pixel is 1.2–10 km, so T6
-// is sub-pixel for hit-test purposes there.
-//
-// Borders (the visible green lines) are NOT drawn from these bundles
-// — they fetch full-precision per-polygon from BOUNDARIES_BASE on
-// demand, preserving the platform's "displayed borders are full
-// precision" invariant.
+// Borders: drawn at T3 immediately (re-using the in-heap hit-target
+// geometry as a stand-in), then upgraded to T6 by background fetch
+// of the per-polygon T6 file from BORDERS_BASE. Same rule for ADM0
+// and ADM1 — see the two-stage policy in reconcileBordersForCode.
 //
 // Microstate hit-targets: the build script enforces an 8-vertex floor
-// per polygon (walking down the fallback tolerance ladder, ultimately
+// per polygon (walking down a fallback tolerance ladder, ultimately
 // shipping the original geometry if even tolerance 0 collapses below
-// 8). At T3 / T6 the inscribed octagon for a tiny island still covers
-// the bulk of its surface area — clickable across most of the island
+// 8). At T3 the inscribed octagon for a tiny island still covers the
+// bulk of its surface area — clickable across most of the island
 // once the user is zoomed in enough to see it.
 const ADM0_TIER = 3;
-const ADM1_TIER = 6;
+const ADM1_TIER = 3;
 const ADM0_BUNDLE_URL = `${SIMPLIFIED_BOUNDARIES_BASE}/adm0-t${ADM0_TIER}.json`;
 const adm1BundleUrl = (parentCode: string) =>
   `${SIMPLIFIED_BOUNDARIES_BASE}/adm1/${parentCode}-t${ADM1_TIER}.json`;
@@ -1377,16 +1394,20 @@ export default function MapCanvas() {
     const inflight = inflightByCodeRef.current.get(code);
     if (inflight) return inflight;
 
-    // Build the R2 path for this code. Code structure mirrors directory
-    // structure: '840' -> '840/840.geojson',
-    //            '840-006' -> '840/840-006/840-006.geojson',
-    //            '156-006-003' -> '156/156-006/156-006-003/156-006-003.geojson'
+    // Build the URL for this code in the per-polygon T6 corpus.
+    // Directory structure mirrors the source-of-truth tree exactly,
+    // but the filename includes a tier suffix:
+    //   '840'         -> '840/840-tN.geojson'
+    //   '840-006'     -> '840/840-006/840-006-tN.geojson'
+    //   '156-006-003' -> '156/156-006/156-006-003/156-006-003-tN.geojson'
+    // N is the BORDER_TIER constant (currently 6 — see top of file
+    // for the rationale on why T6 is the chosen ceiling).
     const parts = code.split('-');
     const dirParts: string[] = [];
     for (let i = 0; i < parts.length; i++) {
       dirParts.push(parts.slice(0, i + 1).join('-'));
     }
-    const url = `${BOUNDARIES_BASE}/${dirParts.join('/')}/${code}.geojson`;
+    const url = `${BORDERS_BASE}/${dirParts.join('/')}/${code}-t${BORDER_TIER}.geojson`;
     if (DEBUG) dbg(`FETCH→ ${code}`);
 
     const promise = fetch(url)
@@ -1967,10 +1988,10 @@ export default function MapCanvas() {
   //     event listeners.
   //   - The parsed GeoJSON tree in contiguousGeomByCodeRef, which is
   //     what those layers were built from. Re-clicking the code will
-  //     re-fetch from boundaries.supercoolradio.com — that's a strict
-  //     network cost but the two-stage border architecture means the
-  //     user sees a (simplified) border immediately on re-click, no
-  //     perceived latency.
+  //     re-fetch from simplified-boundaries.supercoolradio.com — that's
+  //     a strict network cost but the two-stage border architecture
+  //     means the user sees a (simplified) border immediately on
+  //     re-click, no perceived latency.
   //
   // What stays cached forever (simplified tier — small):
   //   - cachedSimpleBordersByKeyRef (the immediate-draw stand-ins)
