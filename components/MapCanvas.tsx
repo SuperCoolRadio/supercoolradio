@@ -773,12 +773,25 @@ export default function MapCanvas() {
   //   is `${code}@${offset}` (see layerKey). A given polygon typically
   //   has 1–3 distinct offsets used over a session.
   //
+  //   cachedBordersByKeyRef holds full-precision border layers (drawn
+  //   from contiguousGeomByCodeRef). cachedSimpleBordersByKeyRef holds
+  //   simplified-precision border layers drawn from the in-heap bundle
+  //   (contiguousSimpleGeomByCodeRef) — these are the "stage 1"
+  //   immediate-draw fallback used while full precision fetches in the
+  //   background. See reconcileBordersForCode for the two-stage policy.
+  //
   // attachedTargetsByCodeRef / attachedBordersByCodeRef:
   //   What's currently on the map. Outer key: code. Inner: offset → layer
   //   instance (same instance as the one in the corresponding cache).
+  //   For borders, the attached instance at any offset can be either the
+  //   simple-precision or the full-precision layer; reconcile compares
+  //   by identity to decide whether an upgrade is needed.
   //   Maintained by the reconcile* helpers below.
   const cachedTargetsByKeyRef = useRef<Map<string, L.GeoJSON>>(new Map());
   const cachedBordersByKeyRef = useRef<Map<string, L.GeoJSON>>(new Map());
+  const cachedSimpleBordersByKeyRef = useRef<Map<string, L.GeoJSON>>(
+    new Map(),
+  );
   const attachedTargetsByCodeRef = useRef<
     Map<string, Map<number, L.GeoJSON>>
   >(new Map());
@@ -988,28 +1001,30 @@ export default function MapCanvas() {
               }
             }
 
-            // Attach codes in desired. reconcileBordersForCode is
-            // idempotent for already-attached codes; for codes whose
-            // full geometry isn't cached yet (typically ADM1+), fetch
-            // first.
+            // Attach codes in desired using the two-stage policy. For
+            // each code, reconcile immediately (which attaches the
+            // simplified stand-in if full precision isn't loaded), then
+            // fire fetchGeometry in the background and re-reconcile on
+            // success to swap simple → full atomically. See the border
+            // useEffect below for the rationale.
             for (const code of desired) {
-              if (contiguousGeomByCodeRef.current.has(code)) {
-                reconcileBordersForCode(code, vL, vR);
-              } else {
-                fetchGeometry(code)
-                  .then(() => {
-                    if (!mapRef.current) return;
-                    // Re-check: user may have navigated away.
-                    const latestPath = pathRef.current;
-                    const latestHover = hoveredCodeRef.current;
-                    const stillDesired =
-                      latestPath.includes(code) || latestHover === code;
-                    if (!stillDesired) return;
-                    const [vL2, vR2] = getViewportLngRange(mapRef.current);
-                    reconcileBordersForCode(code, vL2, vR2);
-                  })
-                  .catch(() => {});
-              }
+              reconcileBordersForCode(code, vL, vR);
+              if (contiguousGeomByCodeRef.current.has(code)) continue;
+              fetchGeometry(code)
+                .then(() => {
+                  if (!mapRef.current) return;
+                  const latestPath = pathRef.current;
+                  const latestHover = hoveredCodeRef.current;
+                  const stillDesired =
+                    latestPath.includes(code) || latestHover === code;
+                  if (!stillDesired) return;
+                  const [vL2, vR2] = getViewportLngRange(mapRef.current);
+                  reconcileBordersForCode(code, vL2, vR2);
+                })
+                .catch(() => {
+                  // Simplified border already attached; non-upgrade is
+                  // invisible to the user.
+                });
             }
           }, 150);
         });
@@ -1547,6 +1562,43 @@ export default function MapCanvas() {
     });
   };
 
+  // Stage-1 border builder — reads from the in-heap simplified-geometry
+  // cache (populated by the ADM0 mount-time bundle and per-parent ADM1
+  // bundles). Identical styling to the full-precision builder above so
+  // the visual swap from simple → full is invisible at typical zoom; the
+  // only visible difference is on jagged-coastline outliers (Nunavut,
+  // Norway, Indonesia) at deep zoom, where the simple form is briefly
+  // visibly stair-stepped before the full version arrives and sharpens
+  // it. See reconcileBordersForCode for the swap mechanics.
+  //
+  // For polygons in the desired set (path[1..] + hover), the simple
+  // geometry is essentially always available — the same geometry that
+  // makes the polygon clickable (via its hit-target) also serves as the
+  // border stand-in. The function returns null only if simple geometry
+  // is genuinely absent, which under current call sites should not
+  // happen.
+  const buildSimpleBorderLayerAt = (
+    code: string,
+    offset: number,
+  ): L.GeoJSON | null => {
+    const baseGeom = contiguousSimpleGeomByCodeRef.current.get(code);
+    if (!baseGeom) return null;
+    const node = treeIndexRef.current?.codeToNode.get(code);
+    const color = node
+      ? BORDER_COLOR_BY_LEVEL[node.level]
+      : BORDER_COLOR_BY_LEVEL.Area;
+    const geom = translateGeometryLng(baseGeom, offset);
+    return L.geoJSON(featureCollectionOf(geom), {
+      style: {
+        fillOpacity: 0,
+        color,
+        weight: BORDER_WEIGHT,
+        className: 'scr-border',
+      },
+      interactive: false,
+    });
+  };
+
   const getOrBuildTargetLayerAt = (
     code: string,
     offset: number,
@@ -1570,6 +1622,19 @@ export default function MapCanvas() {
     const fresh = buildBorderLayerAt(code, offset);
     if (!fresh) return null;
     cachedBordersByKeyRef.current.set(key, fresh);
+    return fresh;
+  };
+
+  const getOrBuildSimpleBorderLayerAt = (
+    code: string,
+    offset: number,
+  ): L.GeoJSON | null => {
+    const key = layerKey(code, offset);
+    const cached = cachedSimpleBordersByKeyRef.current.get(key);
+    if (cached) return cached;
+    const fresh = buildSimpleBorderLayerAt(code, offset);
+    if (!fresh) return null;
+    cachedSimpleBordersByKeyRef.current.set(key, fresh);
     return fresh;
   };
 
@@ -1642,6 +1707,32 @@ export default function MapCanvas() {
     }
   };
 
+  // Two-stage border policy. For each desired offset:
+  //
+  //   1. If a full-precision layer is available (contiguousGeomByCodeRef
+  //      has the code's geometry), attach it. If a different layer (the
+  //      simplified stand-in) is currently attached at this offset, do
+  //      an atomic swap: add the full layer first (which paints on top
+  //      of the simple one in DOM order), then remove the simple layer.
+  //      Visually invisible because both layers carry the same color
+  //      and the same shape modulo sub-pixel detail.
+  //
+  //   2. Otherwise — full not yet loaded — attach the simplified
+  //      stand-in built from contiguousSimpleGeomByCodeRef (which is
+  //      populated for every code in the desired set, since the same
+  //      cache makes the polygon clickable). The caller is responsible
+  //      for kicking off fetchGeometry; when that resolves, this
+  //      function will be called again and will perform the upgrade.
+  //
+  // Stage-1-only behavior (full precision never arrives) is the failure
+  // mode: the user keeps seeing the simplified border. That's a strict
+  // improvement over the pre-two-stage behavior, where a fetch failure
+  // meant no border at all.
+  //
+  // For desired offsets no longer in the desired-offset set (viewport
+  // shifted past the polygon's wrap point), the attached layer at that
+  // offset is detached unconditionally regardless of which quality it
+  // is. Quality only matters for the upgrade decision, not for cleanup.
   const reconcileBordersForCode = (
     code: string,
     viewLeft: number,
@@ -1660,6 +1751,7 @@ export default function MapCanvas() {
 
     const desiredOffsets = new Set(placeForView(bounds, viewLeft, viewRight));
 
+    // Detach offsets no longer desired (regardless of quality).
     for (const [offset, layer] of [...attached]) {
       if (!desiredOffsets.has(offset)) {
         map.removeLayer(layer);
@@ -1667,12 +1759,40 @@ export default function MapCanvas() {
       }
     }
 
+    // Attach or upgrade desired offsets.
     for (const offset of desiredOffsets) {
-      if (attached.has(offset)) continue;
-      const layer = getOrBuildBorderLayerAt(code, offset);
-      if (!layer) continue;
-      layer.addTo(map);
-      attached.set(offset, layer);
+      const fullLayer = getOrBuildBorderLayerAt(code, offset);
+      const currentLayer = attached.get(offset);
+
+      if (fullLayer) {
+        // Full precision is available. Either attach for the first time
+        // or swap simple → full atomically.
+        if (currentLayer === fullLayer) continue;
+        if (currentLayer) {
+          // Atomic swap. Add full first so it paints over simple, then
+          // remove simple. The brief overlap is visually a no-op
+          // because both layers carry the same color and roughly the
+          // same shape — the swap looks like a sub-pixel sharpening,
+          // not a flicker.
+          fullLayer.addTo(map);
+          map.removeLayer(currentLayer);
+        } else {
+          fullLayer.addTo(map);
+        }
+        attached.set(offset, fullLayer);
+      } else {
+        // Full not loaded yet. If something is already attached (the
+        // simplified stand-in from a previous reconcile call, attached
+        // at the same offset), leave it in place — re-using it avoids
+        // the brief no-border flash that would happen if we removed
+        // and re-attached. If nothing is attached yet, attach the
+        // simplified stand-in now.
+        if (currentLayer) continue;
+        const simpleLayer = getOrBuildSimpleBorderLayerAt(code, offset);
+        if (!simpleLayer) continue;
+        simpleLayer.addTo(map);
+        attached.set(offset, simpleLayer);
+      }
     }
   };
 
@@ -2031,48 +2151,57 @@ export default function MapCanvas() {
       }
     }
 
-    // Reconcile each desired code. Borders are drawn from
-    // contiguousGeomByCodeRef (full-resolution), not the simplified
-    // bundle — at country zoom levels the simplified geometry would
-    // look chunky. So the readiness test is "do we have full geom",
-    // not "do we have bounds" or "do we have simple". For ADM0 codes
-    // hydrated from the bundle, bounds and simple are present but
-    // full is not, so we fall through to fetchGeometry — which is
-    // idempotent on the bundle-populated refs and only does the work
-    // (network fetch + parse) needed to populate contiguousGeomByCodeRef.
+    // Two-stage attach for each desired code.
     //
-    // Tradeoff: the user sees a brief delay between selecting a country
-    // and the green border appearing (one HTTP round-trip + parse). A
-    // future optimization could draw the simplified geometry as a
-    // placeholder border immediately and swap in the full-resolution
-    // version when it arrives.
+    // Always call reconcileBordersForCode first — under the two-stage
+    // policy, this attaches the simplified stand-in immediately if full
+    // precision isn't yet loaded, or attaches/keeps full if it is. The
+    // user sees a green border in the same frame as the click or hover.
+    //
+    // If full precision isn't loaded yet, fire fetchGeometry in the
+    // background. When it resolves, re-reconcile to atomically swap
+    // simple → full. If the fetch fails, leave the simplified border in
+    // place (strict improvement over the pre-two-stage behavior, where
+    // a fetch failure meant no border at all).
+    //
+    // Why two-stage matters: full-precision Nunavut (in Canada's ADM1
+    // tree) is several MB of GeoJSON; parsing it and handing it to
+    // Leaflet's SVG renderer synchronously inside the click handler
+    // crashes Mobile Safari. Doing the heavy work in a fetch promise's
+    // .then() callback gives the browser a chance to breathe, and the
+    // user already sees a (simplified) border by then so there's no
+    // perceived latency.
     for (const code of desired) {
-      if (contiguousGeomByCodeRef.current.has(code)) {
-        reconcileBordersForCode(code, viewLeft, viewRight);
-      } else {
-        fetchGeometry(code)
-          .then(() => {
-            // Re-check: path/hover may have changed during fetch.
-            const latestPath = pathRef.current;
-            const latestHover = hoveredCodeRef.current;
-            const latestDesired = new Set<string>();
-            for (let i = 1; i < latestPath.length; i++) {
-              latestDesired.add(latestPath[i]);
-            }
-            if (
-              latestHover &&
-              latestHover !== '000' &&
-              !latestPath.includes(latestHover)
-            ) {
-              latestDesired.add(latestHover);
-            }
-            if (!latestDesired.has(code)) return;
-            if (!mapRef.current) return;
-            const [vL, vR] = getViewportLngRange(mapRef.current);
-            reconcileBordersForCode(code, vL, vR);
-          })
-          .catch(() => {});
-      }
+      reconcileBordersForCode(code, viewLeft, viewRight);
+      if (contiguousGeomByCodeRef.current.has(code)) continue;
+      fetchGeometry(code)
+        .then(() => {
+          // Re-check: path/hover may have changed during fetch.
+          const latestPath = pathRef.current;
+          const latestHover = hoveredCodeRef.current;
+          const latestDesired = new Set<string>();
+          for (let i = 1; i < latestPath.length; i++) {
+            latestDesired.add(latestPath[i]);
+          }
+          if (
+            latestHover &&
+            latestHover !== '000' &&
+            !latestPath.includes(latestHover)
+          ) {
+            latestDesired.add(latestHover);
+          }
+          if (!latestDesired.has(code)) return;
+          if (!mapRef.current) return;
+          const [vL, vR] = getViewportLngRange(mapRef.current);
+          // Re-reconcile: full precision is now loaded, so this call
+          // performs the atomic simple → full swap at every desired
+          // offset for this code.
+          reconcileBordersForCode(code, vL, vR);
+        })
+        .catch(() => {
+          // Stage-1 (simple) border is already attached above; failing
+          // to upgrade to full precision is invisible to the user.
+        });
     }
   }, [path, hoveredCode]);
 
