@@ -694,11 +694,17 @@ const computePolarSafeFlyTarget = (
   const yPolarS_t = fPolarS * targetP;
   const cyMin = yPolarN_t + viewportHeight / 2;
   const cyMax = yPolarS_t - viewportHeight / 2;
-  const boundsCenterLat = (bounds.getNorth() + bounds.getSouth()) / 2;
-  const yBoundsCenter = map.project(
-    L.latLng(boundsCenterLat, 0),
-    targetZoom,
-  ).y;
+  // Use the Mercator-projected midpoint of the bounds, not the
+  // lat-arithmetic midpoint. For high-latitude bounds (e.g. Canada
+  // 41°N–83°N), the lat-arithmetic midpoint (62°N) is far from the
+  // visual center because Mercator stretches latitudes toward the
+  // poles. The visual center of Canada in projected pixel space
+  // corresponds to ~71°N. Using the lat-arithmetic value placed the
+  // camera too far south on wide viewports where this latitude
+  // controls the centering, pushing the top of far-northern
+  // countries off the top of the screen. fN and fS are the projected
+  // y-fractions at zoom 0 already computed above.
+  const yBoundsCenter = ((fN + fS) / 2) * targetP;
   const cyClamped = Math.max(cyMin, Math.min(cyMax, yBoundsCenter));
   const targetLat = map.unproject(L.point(0, cyClamped), targetZoom).lat;
   const targetLng = (bounds.getWest() + bounds.getEast()) / 2;
@@ -1173,6 +1179,15 @@ export default function MapCanvas() {
     container.addEventListener('wheel', handleWheel, { passive: false });
 
     const handleResize = () => {
+      // Refresh Leaflet's cached container size before any further
+      // computation. Without this, after device rotation Leaflet
+      // keeps using the pre-rotation dimensions and subsequent
+      // flyTo / click positioning is offset by the dimension delta
+      // — visible on iPhone as a consistent shift after rotating
+      // until the page is reloaded. Also covers iOS Safari URL-bar
+      // show/hide resizes for free. pan: false avoids unwanted
+      // recentering during the resize itself.
+      map.invalidateSize({ pan: false });
       const newMinZoom = computeMinZoom(
         container.offsetWidth,
         container.offsetHeight,
