@@ -2216,8 +2216,21 @@ export default function MapCanvas() {
     }
 
     // Evict the parsed full-precision GeoJSON. Refetched on re-click.
+    //
+    // EXCEPTION: codes in the Maldives-problem set
+    // (bboxHitTargetCodesRef) have their bbox geometry pinned in this
+    // ref by the bundle-hydration loop, intentionally — so that
+    // fetchGeometry's `has(code)` short-circuit keeps firing and the
+    // T6 fetch never runs (the T6 file would have the natural-shape
+    // atoll geometry, which is exactly what the bbox treatment is
+    // there to bypass). Evicting on every hover/unhover cycle would
+    // cause the next hover to flash the bbox stand-in for a frame and
+    // then upgrade to the atoll geometry, which is the bug Hugh saw
+    // on supercoolradio.net the first time the rule went live.
     const hadGeom = contiguousGeomByCodeRef.current.has(code);
-    contiguousGeomByCodeRef.current.delete(code);
+    if (!bboxHitTargetCodesRef.current.has(code)) {
+      contiguousGeomByCodeRef.current.delete(code);
+    }
     if (DEBUG) {
       const totalCodes = contiguousGeomByCodeRef.current.size;
       let totalVerts = 0;
