@@ -51,6 +51,21 @@ type SimplifiedBundle = {
 const BORDERS_BASE =
   'https://simplified-boundaries.supercoolradio.com/tree';
 
+// Cache-bust version appended as a query string to every URL fetched
+// from the simplified-boundaries domain. Bump this constant after any
+// rebuild of the bundles or per-polygon corpus. Browser cache and
+// Cloudflare edge cache treat ?v=N as part of the cache key, so old
+// cached responses become inert (they'd only be served for the old
+// URL, which nothing requests anymore) and new responses populate
+// freshly. Also avoids needing a Cloudflare purge after each rebuild.
+//
+// Bump history:
+//   v1 — initial deployment (implicit, no query string)
+//   v2 — 2026-05-09 diameter-cap simplifier (DIAMETER_TOLERANCE_DIVISOR=100)
+const BOUNDARIES_VERSION = 'v=2';
+const versioned = (url: string): string =>
+  url + (url.includes('?') ? '&' : '?') + BOUNDARIES_VERSION;
+
 // Tier used for drawn borders. Universal — applies to every level
 // (ADM0, ADM1, eventually ADM2). Picked as the smallest tier that's
 // effectively sub-pixel at our deepest tile zoom; any finer just
@@ -89,9 +104,13 @@ const SIMPLIFIED_BOUNDARIES_BASE =
 // once the user is zoomed in enough to see it.
 const ADM0_TIER = 3;
 const ADM1_TIER = 3;
-const ADM0_BUNDLE_URL = `${SIMPLIFIED_BOUNDARIES_BASE}/adm0-t${ADM0_TIER}.json`;
+const ADM0_BUNDLE_URL = versioned(
+  `${SIMPLIFIED_BOUNDARIES_BASE}/adm0-t${ADM0_TIER}.json`,
+);
 const adm1BundleUrl = (parentCode: string) =>
-  `${SIMPLIFIED_BOUNDARIES_BASE}/adm1/${parentCode}-t${ADM1_TIER}.json`;
+  versioned(
+    `${SIMPLIFIED_BOUNDARIES_BASE}/adm1/${parentCode}-t${ADM1_TIER}.json`,
+  );
 
 // Border color by administrative level. ADM0 (Areas) green, ADM1
 // (Regions) yellow, ADM2 (Sub-Regions) cyan. Bright pure-channel colors
@@ -126,27 +145,26 @@ const setFlyingInactive = (containerEl: HTMLDivElement | null) => {
   }
 };
 
-// Areas whose polygons sit inside another Area's polygon and would
-// otherwise be unclickable because the containing Area's invisible
-// hit-target sits on top. Per Partitioning Rule 5, these are the six
-// "possessions" the algorithm detected: Taiwan inside China; American
-// Samoa, Guam, Northern Mariana Islands, Puerto Rico, and US Virgin
-// Islands inside USA. We bringToFront() these layers after attaching
-// so they paint on top of their container in DOM order, which is what
-// SVG paint order and Leaflet hit-testing both follow.
-const POSSESSION_CODES = new Set([
-  '016', // American Samoa
-  '158', // Taiwan (the Area)
-  '316', // Guam
-  '580', // Northern Mariana Islands
-  '630', // Puerto Rico
-  '850', // US Virgin Islands
-  // Taiwan-as-Region-of-China sits at the END of this set so the
-  // bringToFront iteration delivers it last — above Area 158 at
-  // China view, so users can click it to drill into China > Taiwan.
-  // No effect at world view, where 156-034 isn't attached.
-  '156-034', // Taiwan (province, China-claim)
-]);
+// Hit-target paint-order policy: smallest on top.
+//
+// When two polygons overlap — either a possession contained in its
+// host (Taiwan in China, Guam / PR / ASM / MNP / VIR in USA, Vatican
+// in Italy, Lesotho in South Africa, Gibraltar's footprint relative
+// to Spain), or any contested-territory pair where two ADM0 outlines
+// intersect — the smaller polygon's hit-target must paint on top of
+// the larger one. Otherwise the larger ADM0's invisible hit-target
+// catches every click and hover in the contained region, leaving the
+// smaller polygon effectively unclickable at any zoom.
+//
+// SVG paint order = DOM order, last sibling on top; bringToFront moves
+// the path to the end of the parent SVG group, which is also what
+// Leaflet's hit-testing follows. So we re-stack every attached hit-
+// target layer in descending bbox-area order on each reconcile,
+// calling bringToFront on each in turn — the layer called LAST (the
+// smallest) ends up on top. The reorder is universal: no hand-edited
+// list of special-case codes, no maintenance burden as new map
+// adjustments add small contained polygons. See the re-stack pass at
+// the end of reconcileTargetsForCode.
 
 // Walk tree.json once to build:
 //   - codeToNode: lookup any node by code
@@ -500,6 +518,58 @@ const featureCollectionOf = (
   type: 'FeatureCollection',
   features: [{ type: 'Feature', properties: {}, geometry: geom }],
 });
+
+// Construct a closed-ring Polygon from an axis-aligned bounding box.
+// Vertex order: SW → SE → NE → NW → SW (counter-clockwise when read
+// in standard cartographic convention with north up). Used during
+// bundle hydration to substitute a node's natural geometry with its
+// bbox when the node is in the Maldives-problem set (see the doc
+// block below and bboxHitTargetCodesRef inside the component).
+const bboxToPolygon = (b: {
+  minLat: number;
+  maxLat: number;
+  minLng: number;
+  maxLng: number;
+}): GeoJSON.Geometry => ({
+  type: 'Polygon',
+  coordinates: [
+    [
+      [b.minLng, b.minLat],
+      [b.maxLng, b.minLat],
+      [b.maxLng, b.maxLat],
+      [b.minLng, b.maxLat],
+      [b.minLng, b.minLat],
+    ],
+  ],
+});
+
+// Codes that exhibit the "Maldives problem" — the node's natural
+// geometry is too small or too dispersed for hit-targets and borders
+// rendered from it to be useful. At bundle hydration time, the bbox
+// polygon supplants the simplified geom in both the hit-target cache
+// and the full-precision cache; fetchGeometry then short-circuits
+// because contiguousGeomByCodeRef is already populated. Net effect:
+// clickable region is the entire bbox, hover border is the bbox
+// rectangle, no T6 fetch ever fires.
+//
+// The set is loaded at mount time from /data/bbox-hit-targets.json,
+// which is generated by the build pipeline running
+//   boundaries/scripts/rank_maldives_problem.py
+// across every bundle (ADM0, ADM1, and eventually districts) and
+// emitting every code with land_area / bbox_area below 0.015.
+//
+// Threshold rationale: 0.015 sits in a clean ~5x gap in the ADM0
+// data (worst included country, Wallis and Futuna at 0.004; worst
+// excluded, Solomon Islands at 0.019, which is empirically "barely
+// findable but livable"). Anything below 0.015 is guaranteed to be
+// no worse than that lower bound. The same threshold applies at
+// every level — same metric, same UX problem.
+//
+// At ADM0 the membership is expected to be ~14 codes (Maldives,
+// Marshall Islands, Kiribati, Tuvalu, FSM, Saint Helena, Cook
+// Islands, French Polynesia, Tokelau, Seychelles, Tonga, Mauritius,
+// Palau, Wallis and Futuna). ADM1 and district counts depend on
+// what the build script produces — empty file is a valid result.
 
 // Given a polygon's contiguous-form bounds [polyMin, polyMax] and the
 // map's current viewport longitude range [viewLeft, viewRight], return
@@ -883,6 +953,18 @@ export default function MapCanvas() {
 
   // In-flight fetch promises by code, to dedupe concurrent loads.
   const inflightByCodeRef = useRef<Map<string, Promise<void>>>(new Map());
+
+  // Codes that should be rendered with their bbox as the hit-target
+  // and border geometry instead of their natural shape — see the
+  // Maldives-problem doc block above the geometry helpers.
+  // Populated at mount from /data/bbox-hit-targets.json, after which
+  // it's read-only. ADM0 hydration consults it as a gate; ADM1
+  // hydration consults the same ref for the same purpose. If the
+  // file fails to load (404 / network error / malformed) the ref
+  // stays empty, every node gets normal hit-targets, and the only
+  // user-visible regression is that the "Maldives problem"
+  // countries become hard to click. Logged but not fatal.
+  const bboxHitTargetCodesRef = useRef<Set<string>>(new Set());
 
   // In-flight per-parent ADM1 bundle fetches, keyed by parent code (the
   // ADM0 code, e.g. '840' for USA). One bundle per subdivided country
@@ -1333,6 +1415,21 @@ export default function MapCanvas() {
         return res.json();
       });
 
+    // Fire in parallel with tree + bundle. If it fails, log and
+    // proceed with an empty set — see comment on bboxHitTargetCodesRef.
+    const bboxHitTargetsP = fetch('/data/bbox-hit-targets.json')
+      .then((res) => {
+        if (!res.ok) throw new Error(`bbox-hit-targets.json HTTP ${res.status}`);
+        return res.json() as Promise<{ codes: string[] }>;
+      })
+      .catch((err) => {
+        console.warn(
+          '[SCR] bbox-hit-targets.json failed to load — Maldives-problem nodes will fall back to natural hit-targets:',
+          err,
+        );
+        return { codes: [] as string[] };
+      });
+
     const bundleP = fetch(ADM0_BUNDLE_URL)
       .then((res) => {
         if (!res.ok) {
@@ -1341,9 +1438,21 @@ export default function MapCanvas() {
         return res.json();
       });
 
-    Promise.all([treeP, bundleP])
-      .then(([tree, bundle]: [TreeNode, SimplifiedBundle]) => {
+    Promise.all([treeP, bundleP, bboxHitTargetsP])
+      .then(([tree, bundle, bboxData]: [
+        TreeNode,
+        SimplifiedBundle,
+        { codes: string[] },
+      ]) => {
         if (!stillMounted) return;
+
+        // Populate the ref BEFORE hydrating any bundle, since both
+        // hydration loops (ADM0 here, ADM1 in fetchAdm1Bundle) gate
+        // their bbox-substitution on this set.
+        bboxHitTargetCodesRef.current = new Set(bboxData.codes);
+        console.log(
+          `[SCR] bbox-hit-targets.json loaded — ${bboxHitTargetCodesRef.current.size} codes`,
+        );
 
         // Index the tree.
         const idx = indexTree(tree);
@@ -1358,6 +1467,11 @@ export default function MapCanvas() {
         // code has bounds + simplified contiguous geometry available
         // synchronously. contiguousGeomByCodeRef stays untouched; full
         // geometry is fetched lazily.
+        //
+        // Exception: codes in bboxHitTargetCodesRef get their natural
+        // geometry replaced with a bbox polygon, and also have
+        // contiguousGeomByCodeRef pre-populated so the lazy T6 fetch
+        // never fires for them.
         let hydratedCount = 0;
         for (const [code, entry] of Object.entries(bundle)) {
           const b = entry.bounds;
@@ -1365,7 +1479,12 @@ export default function MapCanvas() {
             code,
             L.latLngBounds([b.minLat, b.minLng], [b.maxLat, b.maxLng]),
           );
-          contiguousSimpleGeomByCodeRef.current.set(code, entry.geom);
+          let geom: GeoJSON.Geometry = entry.geom;
+          if (bboxHitTargetCodesRef.current.has(code)) {
+            geom = bboxToPolygon(b);
+            contiguousGeomByCodeRef.current.set(code, geom);
+          }
+          contiguousSimpleGeomByCodeRef.current.set(code, geom);
           hydratedCount++;
         }
         console.log(
@@ -1379,6 +1498,28 @@ export default function MapCanvas() {
           dbg(
             `BUNDLE adm0-t${ADM0_TIER} +${hydratedCount} | simple-cache: ${contiguousSimpleGeomByCodeRef.current.size} codes ${simpleVerts.toLocaleString()}v`,
           );
+        }
+
+        // PERMANENT: dark-green outline around Vatican City (ISO 336)
+        // at all zooms so users can locate it. Vatican is extremely
+        // small (~40 verts at T3, smaller than one screen pixel at
+        // world zoom and barely a few pixels even at country-zoom on
+        // Italy), and Italy's ADM0 polygon does not carve a hole for
+        // the Vatican enclave — so the normal green border alone is
+        // unfindable against Italy's overlapping border at any zoom.
+        // Dark green (#006400) reads clearly against NASA Blue Marble
+        // tiles without being eye-grabbing. No fill, non-interactive,
+        // never removed.
+        const vaticanEntry = bundle['336'];
+        if (vaticanEntry && mapRef.current) {
+          L.geoJSON(featureCollectionOf(vaticanEntry.geom), {
+            style: {
+              color: '#006400',
+              weight: 2,
+              fillOpacity: 0,
+            },
+            interactive: false,
+          }).addTo(mapRef.current);
         }
 
         // Trigger first render: build World's children (Areas) as
@@ -1422,7 +1563,9 @@ export default function MapCanvas() {
     for (let i = 0; i < parts.length; i++) {
       dirParts.push(parts.slice(0, i + 1).join('-'));
     }
-    const url = `${BORDERS_BASE}/${dirParts.join('/')}/${code}-t${BORDER_TIER}.geojson`;
+    const url = versioned(
+      `${BORDERS_BASE}/${dirParts.join('/')}/${code}-t${BORDER_TIER}.geojson`,
+    );
     if (DEBUG) dbg(`FETCH→ ${code}`);
 
     const promise = fetch(url)
@@ -1603,7 +1746,16 @@ export default function MapCanvas() {
             code,
             L.latLngBounds([b.minLat, b.minLng], [b.maxLat, b.maxLng]),
           );
-          contiguousSimpleGeomByCodeRef.current.set(code, entry.geom);
+          // Apply the same Maldives-problem special case as ADM0:
+          // if this ADM1 code is in the bbox-hit-target set, swap
+          // its geom for the bbox and pre-populate the full-precision
+          // cache so the lazy T6 fetch short-circuits.
+          let geom: GeoJSON.Geometry = entry.geom;
+          if (bboxHitTargetCodesRef.current.has(code)) {
+            geom = bboxToPolygon(b);
+            contiguousGeomByCodeRef.current.set(code, geom);
+          }
+          contiguousSimpleGeomByCodeRef.current.set(code, geom);
           hydratedCount++;
         }
         console.log(
@@ -1857,29 +2009,39 @@ export default function MapCanvas() {
       if (!layer) continue;
       layer.addTo(map);
       attached.set(offset, layer);
-      // Possessions (Taiwan, PR, Guam, MNP, ASM, VIR) need to sit on top
-      // of their containers so clicks/hovers land on the possession
-      // rather than the surrounding country. SVG paint order = DOM
-      // order, last sibling on top; bringToFront moves the path to the
-      // end of the parent SVG group. Done after addTo so the path
-      // exists in the DOM by the time we reorder it.
-      if (POSSESSION_CODES.has(code)) {
-        layer.bringToFront();
+    }
+
+    // Re-stack every attached hit-target layer in descending bbox-area
+    // order. SVG paint order = DOM order, last sibling on top; calling
+    // bringToFront moves a path to the end of the parent SVG group, so
+    // iterating largest-first and calling bringToFront on each lands
+    // the smallest one last — and on top, where it correctly receives
+    // clicks/hovers ahead of any larger polygon it sits inside. This
+    // subsumes the previous hand-maintained possessions list: Taiwan,
+    // Guam, Puerto Rico, ASM, MNP, VIR all rise to the top under the
+    // area rule because they're smaller than their containers, as do
+    // Vatican / Monaco / Lesotho / Gibraltar / San Marino and any
+    // future contained-polygon case without code changes.
+    //
+    // Bbox area uses (north - south) × (east - west) on the cached
+    // L.LatLngBounds — accuracy doesn't matter for ordering since
+    // bbox sizes differ by orders of magnitude across the cases that
+    // matter. Cost: a sort plus one bringToFront per attached layer
+    // (a few hundred at most), runs only on reconcile (zoom, pan
+    // beyond the wrap window, path change), not on every mouse move.
+    const reorderable: Array<{ area: number; layer: L.GeoJSON }> = [];
+    for (const [c, offsetMap] of attachedTargetsByCodeRef.current) {
+      const b = boundsByCodeRef.current.get(c);
+      if (!b) continue;
+      const area =
+        (b.getNorth() - b.getSouth()) * (b.getEast() - b.getWest());
+      for (const lyr of offsetMap.values()) {
+        reorderable.push({ area, layer: lyr });
       }
     }
-    // Re-bump every attached possession to the front, regardless of
-    // which code we're reconciling. The bringToFront inside the for
-    // loop only fires when the possession itself is being newly
-    // attached; a container that attaches LATER would otherwise end up
-    // at the end of DOM order (on top), shadowing the possession's hit
-    // target. Reasserting the invariant on every reconcile makes the
-    // ordering independent of fetch-completion order.
-    for (const possCode of POSSESSION_CODES) {
-      const possAttached = attachedTargetsByCodeRef.current.get(possCode);
-      if (!possAttached) continue;
-      for (const possLayer of possAttached.values()) {
-        possLayer.bringToFront();
-      }
+    reorderable.sort((a, b) => b.area - a.area);
+    for (const { layer: lyr } of reorderable) {
+      lyr.bringToFront();
     }
   };
 
