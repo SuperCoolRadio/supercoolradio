@@ -966,6 +966,18 @@ export default function MapCanvas() {
   // countries become hard to click. Logged but not fatal.
   const bboxHitTargetCodesRef = useRef<Set<string>>(new Set());
 
+  // Bbox polygons for nodes in the Maldives-problem set, keyed by
+  // code. Populated at hydration time alongside the natural geometry
+  // — for these codes, the hit-target layer reads from this ref
+  // (bbox shape, large click region) while the visible-border layer
+  // continues to read from contiguousSimpleGeomByCodeRef /
+  // contiguousGeomByCodeRef (natural shape, accurate visualization).
+  // Decoupling the two means a user clicking anywhere inside Maldives'
+  // bounding box hits the country, but the green hover border traces
+  // the actual atolls so users can see the geography. Never evicted;
+  // computed once at hydration from the bundle's bounds.
+  const bboxGeomByCodeRef = useRef<Map<string, GeoJSON.Geometry>>(new Map());
+
   // In-flight per-parent ADM1 bundle fetches, keyed by parent code (the
   // ADM0 code, e.g. '840' for USA). One bundle per subdivided country
   // hydrates all of that country's ADM1 children in a single fetch,
@@ -1468,10 +1480,14 @@ export default function MapCanvas() {
         // synchronously. contiguousGeomByCodeRef stays untouched; full
         // geometry is fetched lazily.
         //
-        // Exception: codes in bboxHitTargetCodesRef get their natural
-        // geometry replaced with a bbox polygon, and also have
-        // contiguousGeomByCodeRef pre-populated so the lazy T6 fetch
-        // never fires for them.
+        // For codes in bboxHitTargetCodesRef, ALSO compute and cache a
+        // bbox polygon in bboxGeomByCodeRef. That polygon is read by
+        // buildTargetLayerAt (the hit-target / click region), giving
+        // those countries a wide rectangular click area. The
+        // contiguousSimpleGeomByCodeRef entry stays as the natural
+        // simplified geometry, so the visible green hover border still
+        // traces the actual coastline / atolls — only the click region
+        // is widened.
         let hydratedCount = 0;
         for (const [code, entry] of Object.entries(bundle)) {
           const b = entry.bounds;
@@ -1479,12 +1495,10 @@ export default function MapCanvas() {
             code,
             L.latLngBounds([b.minLat, b.minLng], [b.maxLat, b.maxLng]),
           );
-          let geom: GeoJSON.Geometry = entry.geom;
+          contiguousSimpleGeomByCodeRef.current.set(code, entry.geom);
           if (bboxHitTargetCodesRef.current.has(code)) {
-            geom = bboxToPolygon(b);
-            contiguousGeomByCodeRef.current.set(code, geom);
+            bboxGeomByCodeRef.current.set(code, bboxToPolygon(b));
           }
-          contiguousSimpleGeomByCodeRef.current.set(code, geom);
           hydratedCount++;
         }
         console.log(
@@ -1746,16 +1760,14 @@ export default function MapCanvas() {
             code,
             L.latLngBounds([b.minLat, b.minLng], [b.maxLat, b.maxLng]),
           );
-          // Apply the same Maldives-problem special case as ADM0:
-          // if this ADM1 code is in the bbox-hit-target set, swap
-          // its geom for the bbox and pre-populate the full-precision
-          // cache so the lazy T6 fetch short-circuits.
-          let geom: GeoJSON.Geometry = entry.geom;
+          contiguousSimpleGeomByCodeRef.current.set(code, entry.geom);
+          // Maldives-problem ADM1s (e.g. Hawaii, Lakshadweep) get a
+          // bbox polygon cached for hit-target use; the visible border
+          // continues to use the natural geometry. See the comment on
+          // bboxGeomByCodeRef.
           if (bboxHitTargetCodesRef.current.has(code)) {
-            geom = bboxToPolygon(b);
-            contiguousGeomByCodeRef.current.set(code, geom);
+            bboxGeomByCodeRef.current.set(code, bboxToPolygon(b));
           }
-          contiguousSimpleGeomByCodeRef.current.set(code, geom);
           hydratedCount++;
         }
         console.log(
@@ -1794,7 +1806,15 @@ export default function MapCanvas() {
   // in cachedTargetsByKeyRef / cachedBordersByKeyRef forever after.
 
   const buildTargetLayerAt = (code: string, offset: number): L.GeoJSON | null => {
+    // Hit-target geometry resolution order: bbox (for Maldives-problem
+    // codes that have one cached) → simple → full. The bbox preference
+    // is what gives those countries their wide click region; for every
+    // other code the bbox cache is empty and we fall through to the
+    // natural simplified geometry. Borders read from the simple/full
+    // refs directly, never from the bbox cache, so the hover outline
+    // always traces the actual coastline.
     const baseGeom =
+      bboxGeomByCodeRef.current.get(code) ??
       contiguousSimpleGeomByCodeRef.current.get(code) ??
       contiguousGeomByCodeRef.current.get(code);
     if (!baseGeom) return null;
@@ -2216,21 +2236,8 @@ export default function MapCanvas() {
     }
 
     // Evict the parsed full-precision GeoJSON. Refetched on re-click.
-    //
-    // EXCEPTION: codes in the Maldives-problem set
-    // (bboxHitTargetCodesRef) have their bbox geometry pinned in this
-    // ref by the bundle-hydration loop, intentionally — so that
-    // fetchGeometry's `has(code)` short-circuit keeps firing and the
-    // T6 fetch never runs (the T6 file would have the natural-shape
-    // atoll geometry, which is exactly what the bbox treatment is
-    // there to bypass). Evicting on every hover/unhover cycle would
-    // cause the next hover to flash the bbox stand-in for a frame and
-    // then upgrade to the atoll geometry, which is the bug Hugh saw
-    // on supercoolradio.net the first time the rule went live.
     const hadGeom = contiguousGeomByCodeRef.current.has(code);
-    if (!bboxHitTargetCodesRef.current.has(code)) {
-      contiguousGeomByCodeRef.current.delete(code);
-    }
+    contiguousGeomByCodeRef.current.delete(code);
     if (DEBUG) {
       const totalCodes = contiguousGeomByCodeRef.current.size;
       let totalVerts = 0;
