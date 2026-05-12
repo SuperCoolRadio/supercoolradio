@@ -62,7 +62,7 @@ const BORDERS_BASE =
 // Bump history:
 //   v1 — initial deployment (implicit, no query string)
 //   v2 — 2026-05-09 diameter-cap simplifier (DIAMETER_TOLERANCE_DIVISOR=100)
-const BOUNDARIES_VERSION = 'v=2';
+const BOUNDARIES_VERSION = 'v=3';
 const versioned = (url: string): string =>
   url + (url.includes('?') ? '&' : '?') + BOUNDARIES_VERSION;
 

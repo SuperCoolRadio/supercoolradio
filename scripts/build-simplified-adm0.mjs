@@ -277,8 +277,12 @@ const main = async () => {
   }
 
   const entries = await readdir(BOUNDARIES_TREE, { withFileTypes: true });
+  // ADM0 codes are three digits, optionally followed by a single lowercase
+  // letter for split_adm0 synthetic Areas (PSE-G → 275a, PSE-W → 275b).
+  // The letter convention is established by build_tree_json.py's
+  // SPECIAL_AREA_CODES dict.
   const codes = entries
-    .filter((e) => e.isDirectory() && /^\d{3}$/.test(e.name))
+    .filter((e) => e.isDirectory() && /^\d{3}[a-z]?$/.test(e.name))
     .map((e) => e.name)
     .sort();
 
