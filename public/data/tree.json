@@ -715,7 +715,8 @@
       "level": "Area",
       "iso_alpha3": "BMU",
       "population": 66488,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "064",
@@ -1032,7 +1033,8 @@
       "level": "Area",
       "iso_alpha3": "VGB",
       "population": 34763,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "096",
@@ -1461,7 +1463,8 @@
       "level": "Area",
       "iso_alpha3": "CYM",
       "population": 76376,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "140",
@@ -2141,7 +2144,8 @@
       "level": "Area",
       "iso_alpha3": "MYT",
       "population": 270172,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "178",
@@ -2404,7 +2408,8 @@
       "level": "Area",
       "iso_alpha3": "COK",
       "population": 17415,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "554"
     },
     {
       "code": "188",
@@ -2649,7 +2654,8 @@
       "level": "Area",
       "iso_alpha3": "FRO",
       "population": 53558,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "208"
     },
     {
       "code": "238",
@@ -2658,7 +2664,8 @@
       "level": "Area",
       "iso_alpha3": "FLK",
       "population": 2680,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "242",
@@ -2813,7 +2820,8 @@
       "level": "Area",
       "iso_alpha3": "GUF",
       "population": 357946,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "258",
@@ -2822,7 +2830,8 @@
       "level": "Area",
       "iso_alpha3": "PYF",
       "population": 310166,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "262",
@@ -3195,7 +3204,8 @@
       "level": "Area",
       "iso_alpha3": "GIB",
       "population": 37063,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "296",
@@ -3222,7 +3232,8 @@
       "level": "Area",
       "iso_alpha3": "GRL",
       "population": 1478,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "208"
     },
     {
       "code": "308",
@@ -3240,7 +3251,8 @@
       "level": "Area",
       "iso_alpha3": "GLP",
       "population": 427535,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "316",
@@ -6017,7 +6029,8 @@
       "level": "Area",
       "iso_alpha3": "MTQ",
       "population": 420517,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "478",
@@ -6379,7 +6392,8 @@
       "level": "Area",
       "iso_alpha3": "MSR",
       "population": 5345,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "504",
@@ -6718,7 +6732,8 @@
       "level": "Area",
       "iso_alpha3": "CUW",
       "population": 175682,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "528"
     },
     {
       "code": "533",
@@ -6727,7 +6742,8 @@
       "level": "Area",
       "iso_alpha3": "ABW",
       "population": 117100,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "528"
     },
     {
       "code": "535",
@@ -6736,7 +6752,8 @@
       "level": "Area",
       "iso_alpha3": "BES",
       "population": 23218,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "528"
     },
     {
       "code": "540",
@@ -6745,7 +6762,8 @@
       "level": "Area",
       "iso_alpha3": "NCL",
       "population": 299222,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "548",
@@ -7190,7 +7208,8 @@
       "level": "Area",
       "iso_alpha3": "NIU",
       "population": 1390,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "554"
     },
     {
       "code": "578",
@@ -7519,7 +7538,8 @@
       "level": "Area",
       "iso_alpha3": "PCN",
       "population": 74,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "616",
@@ -7729,7 +7749,8 @@
       "level": "Area",
       "iso_alpha3": "REU",
       "population": 963062,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "642",
@@ -8568,7 +8589,8 @@
       "level": "Area",
       "iso_alpha3": "BLM",
       "population": 11770,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "654",
@@ -8577,7 +8599,8 @@
       "level": "Area",
       "iso_alpha3": "SHN",
       "population": 4017,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "659",
@@ -8595,7 +8618,8 @@
       "level": "Area",
       "iso_alpha3": "AIA",
       "population": 15089,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "662",
@@ -10677,7 +10701,8 @@
       "level": "Area",
       "iso_alpha3": "TKL",
       "population": 1313,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "554"
     },
     {
       "code": "776",
@@ -11471,7 +11496,8 @@
       "level": "Area",
       "iso_alpha3": "TCA",
       "population": 45984,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "798",
@@ -12100,7 +12126,8 @@
       "level": "Area",
       "iso_alpha3": "GGY",
       "population": 65359,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "833",
@@ -12109,7 +12136,8 @@
       "level": "Area",
       "iso_alpha3": "IMN",
       "population": 93698,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "826"
     },
     {
       "code": "834",
@@ -13043,7 +13071,8 @@
       "level": "Area",
       "iso_alpha3": "WLF",
       "population": 10336,
-      "terminal": true
+      "terminal": true,
+      "possession_of": "250"
     },
     {
       "code": "882",
