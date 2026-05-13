@@ -1807,6 +1807,15 @@
           "shape_id": "43563684B73528730180553",
           "population": 63551352,
           "terminal": true
+        },
+        {
+          "code": "156-034",
+          "name": "Taiwan",
+          "display_name": "Taiwan",
+          "level": "Region",
+          "shape_id": "43563684B32372453033755",
+          "population": 23570438,
+          "terminal": true
         }
       ]
     },
