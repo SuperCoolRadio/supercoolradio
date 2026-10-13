@@ -1075,15 +1075,51 @@ export default function MapCanvas() {
       crs: customCRS,
     });
 
-    L.tileLayer('https://tiles.supercoolradio.com/tiles/{z}/{x}/{y}.webp', {
-      tileSize: 512,
-      zoomOffset: -1,
-      minZoom: 0,
-      maxNativeZoom: 8,
-      maxZoom: 18,
-      noWrap: false,
-      className: 'scr-tiles',
-    }).addTo(map);
+    // Basemaps. NASA Blue Marble is the default; OpenStreetMap is the
+    // alternative, chosen with the layers control. Both use the standard
+    // Web Mercator tile grid, so borders sit identically on either.
+    //
+    // Blue Marble tiles are 512px, levels 0–8. zoomOffset -1 requests
+    // level z-1 at map zoom z, and Leaflet clamps the map zoom to
+    // maxNativeZoom before applying the offset, so maxNativeZoom 9 is
+    // what makes level 8 load; deeper zooms stretch level 8.
+    const blueMarble = L.tileLayer(
+      'https://tiles.supercoolradio.com/tiles/{z}/{x}/{y}.webp',
+      {
+        tileSize: 512,
+        zoomOffset: -1,
+        minZoom: 0,
+        maxNativeZoom: 9,
+        maxZoom: 18,
+        noWrap: false,
+        className: 'scr-tiles',
+        attribution: 'Imagery: NASA Earth Observatory (Blue Marble)',
+      },
+    );
+    // Standard OSM tiles are 256px, native through zoom 19 (the map
+    // itself stops at 18).
+    const openStreetMap = L.tileLayer(
+      'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      {
+        minZoom: 0,
+        maxNativeZoom: 19,
+        maxZoom: 18,
+        noWrap: false,
+        attribution:
+          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      },
+    );
+    blueMarble.addTo(map);
+    L.control
+      .layers(
+        { 'NASA Blue Marble': blueMarble, OpenStreetMap: openStreetMap },
+        undefined,
+        { collapsed: false, position: 'topright' },
+      )
+      .addTo(map);
+    // Credits for whichever basemap is showing (the map is created with
+    // attributionControl: false so the control can omit Leaflet's prefix).
+    L.control.attribution({ prefix: false, position: 'bottomright' }).addTo(map);
 
     const NORTH_LIMIT = 85.051;
     const SOUTH_LIMIT = -85.051;
