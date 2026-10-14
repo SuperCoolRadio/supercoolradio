@@ -3,6 +3,11 @@
 import { useEffect, useRef, useState } from 'react';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import type { StyleSpecification } from 'maplibre-gl';
+import '@maplibre/maplibre-gl-leaflet';
+import { DeepTileLayer } from './deepTileLayer';
+import osmOverlayStyle from './osm-overlay-style.json';
 
 type TreeNode = {
   code: string;
@@ -676,6 +681,12 @@ const shiftLngToNearest = (targetLng: number, refLng: number): number =>
 // to ±85.051°), so the seam is off-screen. The map's panning extent and
 // rendered tile area are unchanged — this only affects where vertices
 // past the old clamp project to.
+// Deepest map zoom (Hugh, 2026-10-13: "Eventually, we will go even
+// higher, maybe infinitely"), and the deepest zoom the OSM overlay can
+// follow (MapLibre's maximum zoom 24 is map zoom 25).
+const MAX_ZOOM = 30;
+const OVERLAY_MAX_ZOOM = 25;
+
 const customCRS = L.Util.extend({}, L.CRS.EPSG3857, {
   projection: L.Util.extend({}, L.Projection.SphericalMercator, {
     MAX_LATITUDE: 86,
@@ -1065,7 +1076,7 @@ export default function MapCanvas() {
       center: [20, 0],
       zoom: Math.max(2, initialMinZoom),
       minZoom: initialMinZoom,
-      maxZoom: 18,
+      maxZoom: MAX_ZOOM,
       worldCopyJump: true,
       zoomControl: false,
       attributionControl: false,
@@ -1079,37 +1090,86 @@ export default function MapCanvas() {
     // alternative, chosen with the layers control. Both use the standard
     // Web Mercator tile grid, so borders sit identically on either.
     //
-    // Blue Marble tiles are 512px, levels 0–8. zoomOffset -1 requests
-    // level z-1 at map zoom z, and Leaflet clamps the map zoom to
-    // maxNativeZoom before applying the offset, so maxNativeZoom 9 is
-    // what makes level 8 load; deeper zooms stretch level 8.
-    const blueMarble = L.tileLayer(
+    // Blue Marble tiles are 512px, levels 0–8; zoomOffset -1 requests
+    // level z-1 at map zoom z, so level 8 is map zoom 9. Deeper zooms
+    // (to MAX_ZOOM) crop level-8 tiles; see DeepTileLayer.
+    const blueMarble = new DeepTileLayer(
       'https://tiles.supercoolradio.com/tiles/{z}/{x}/{y}.webp',
+      8,
       {
         tileSize: 512,
         zoomOffset: -1,
         minZoom: 0,
-        maxNativeZoom: 9,
-        maxZoom: 18,
+        maxZoom: MAX_ZOOM,
         noWrap: false,
         className: 'scr-tiles',
         attribution: 'Imagery: NASA Earth Observatory (Blue Marble)',
       },
     );
-    // Standard OSM tiles are 256px, native through zoom 19 (the map
-    // itself stops at 18).
-    const openStreetMap = L.tileLayer(
+    // Standard OSM tiles are 256px, native through zoom 19; deeper zooms
+    // crop level-19 tiles.
+    const openStreetMap = new DeepTileLayer(
       'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      19,
       {
         minZoom: 0,
-        maxNativeZoom: 19,
-        maxZoom: 18,
+        maxZoom: MAX_ZOOM,
         noWrap: false,
         attribution:
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       },
     );
     blueMarble.addTo(map);
+
+    // OSM overlay: scr-core's locked style (src/osm_overlay, Web Repo
+    // Ruling v2), shown whenever Blue Marble is the basemap (the
+    // OpenStreetMap basemap shows as before, without it), drawn by
+    // MapLibre GL in its own pane above the basemap and below the borders. It ignores the mouse, so hover
+    // and click reach the borders exactly as before. MapLibre stops at
+    // its zoom 24 (map zoom 25); deeper, the pane is hidden and only the
+    // basemap shows. Without WebGL the overlay is skipped and the site
+    // works exactly as before.
+    const overlayPane = map.createPane('osmOverlay');
+    overlayPane.style.zIndex = '250';
+    overlayPane.style.pointerEvents = 'none';
+    // MapLibre needs WebGL; check first, so a browser without it never
+    // gets a half-added layer (its zoom hooks would then throw).
+    const probe = document.createElement('canvas');
+    const hasWebGL = !!(probe.getContext('webgl2') || probe.getContext('webgl'));
+    let overlay: L.MaplibreGL | null = null;
+    try {
+      if (!hasWebGL) throw new Error('no WebGL');
+      overlay = L.maplibreGL({
+        style: osmOverlayStyle as unknown as StyleSpecification,
+        interactive: false,
+        maxZoom: OVERLAY_MAX_ZOOM - 1,
+        // Leaflet layer options, passed through by the plugin
+        ...({
+          pane: 'osmOverlay',
+          attribution:
+            '<a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        } as object),
+      });
+      overlay.addTo(map);
+    } catch (err) {
+      console.warn('OSM overlay unavailable:', err);
+      if (overlay) {
+        // Added but failed inside. Leaflet hooked the layer's map events
+        // before calling its onAdd; its 'remove' event unhooks them.
+        overlay.fire('remove');
+        try {
+          map.removeLayer(overlay);
+        } catch {
+          // its own cleanup may fail too; the hooks are already off
+        }
+      }
+    }
+    const showOverlay = () => {
+      const on = map.hasLayer(blueMarble) && map.getZoom() <= OVERLAY_MAX_ZOOM;
+      overlayPane.style.display = on ? '' : 'none';
+    };
+    map.on('zoomend baselayerchange', showOverlay);
+    showOverlay();
     L.control
       .layers(
         { 'NASA Blue Marble': blueMarble, OpenStreetMap: openStreetMap },
