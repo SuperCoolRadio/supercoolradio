@@ -13,10 +13,11 @@ This ruling authorizes Claude Code to make one change to the production website:
 - On the site's own borders and the overlay's borders: "For now, we are keeping both."
 - "The web page will change in one way only: The Blue Marble will have an OSM overlay, black and white, with the zoom levels we decided on. Not optional, always there."
 - "Changed my mind. I forgot that we already had that switch there now. What I would like: Keep the switch. When activated, it does OSM, as it does righ tnow. When not activated, it does blue marble, with our overlay we came up with today."
+- After comparing the preview with the test page: "make everythign happen 0.5 zoom steps earlier." (The website zooms in half steps, the test page in whole steps.)
 
 ## Items
 
-1. **The overlay.** Draw scr-core's locked style (`src/osm_overlay/osm-overlay-style.json`, scr-core commit c4b07da) over the base map:
+1. **The overlay.** Draw scr-core's locked style (`src/osm_overlay/osm-overlay-style.json`, scr-core commit bf3bc4d, every feature half a zoom before its whole-number zoom) over the base map:
    - shown whenever Blue Marble is the basemap, with no control of its own; the existing basemap switch is kept, and choosing OpenStreetMap shows that map exactly as before, without the overlay;
    - in its own map pane, below the site's borders and labels, and ignoring the mouse, so hover and click behave exactly as before.
 
